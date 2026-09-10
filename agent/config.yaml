@@ -1,0 +1,9 @@
+# 에이전트 환경설정
+
+device_id: "dev-001"
+device_url: "socket://127.0.0.1:5555"   # pyserial serial_for_url() 에 그대로 전달
+backend_url: "http://127.0.0.1:8000"
+heartbeat_interval_sec: 10
+command_poll_interval_sec: 2
+device_ack_timeout_sec: 3
+log_level: "INFO"
