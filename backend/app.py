@@ -75,6 +75,33 @@ def device_heartbeat(device_id: str, body: HeartbeatIn) -> dict[str, Any]:
     return {"status": "ok", "device_alive": body.device_alive}
 
 
+
+@app.get("/api/v1/devices/{device_id}/commands/pending")
+def get_pending_commands(device_id: str) -> dict[str, Any]:
+    with _lock:
+        device = _require_device(device_id)
+        
+        # test용도
+        import random
+        rand_val = random.randint(0, 1)
+        rand_cmd_id = random.randint(1, 9999)
+        if rand_val == 1:
+            pending = {"command_id": rand_cmd_id, "type": "SET_LED", "value": "on"}
+        else:
+            pending = {}
+   
+    logger.info("pending %s", device_id)
+    return pending
+
+class CommandUpdate(BaseModel):
+    status: str
+    reason: str | None = None
+
+@app.patch("/api/v1/commands/{command_id}")
+def update_command(command_id: str, body: CommandUpdate) -> dict[str, Any]:
+    logger.info("command %s updated status=%s reason=%s", command_id, body.status, body.reason)
+    return {"status": "ok", "status": body.status, "reason": body.reason if body.reason else None}
+
 if __name__ == "__main__":
     import uvicorn
 
