@@ -10,6 +10,7 @@ from pathlib import Path
 import threading
 import serial
 import yaml
+import requests
 
 CONFIG_PATH = Path(__file__).with_name("config.yaml")
 logger = logging.getLogger("svagent")
@@ -55,9 +56,9 @@ class SVAgent:
         self.heartbeat_interval = float(cfg["heartbeat_interval_sec"])
         self.command_poll_interval = float(cfg["command_poll_interval_sec"])
         self.device_ack_timeout = float(cfg["device_ack_timeout_sec"])
-        self.last_data_at = None
+        self.device_alive = False
         self.ser: serial.Serial | None = None
-        self.cmd_queue: list[bytes] = []
+        self.cmd_queue: list[dict] = []
 
         
     def connect_device(self) -> None:
@@ -80,12 +81,35 @@ class SVAgent:
         else:
             logger.warning("device is not connected")
 
-    def send_heartbeat(self) -> None:
-        # REST API로 백엔드로 heartbeat 전송
-        pass
+    def send_api(self, api: str, data: str, cmd_status: str, cmd_id: str) -> requests.Response:
+        response = None
+        try:
+            if api == "pending": #2초마다
+                response = requests.get(f"{self.backend_url}/api/v1/devices/{self.device_id}/commands/pending")
+            elif api == "data_upload": #5초마다
+                response = requests.post(f"{self.backend_url}/api/v1/devices/{self.device_id}/telemetry", json={"data": data})
+            elif api == "device_heartbeat": #10초마다
+                response = requests.post(f"{self.backend_url}/api/v1/devices/{self.device_id}/heartbeat", json={"device_alive": self.device_alive})
+            elif api == "cmd_send": #불특정하게
+                if cmd_status == "ACKED":
+                    response = requests.patch(f"{self.backend_url}/api/v1/commands/{cmd_id}", json={"status": cmd_status})
+                elif cmd_status == "FAILED":
+                    response = requests.patch(f"{self.backend_url}/api/v1/commands/{cmd_id}", json={"status": cmd_status, "reason": "device_timeout"})
+            elif api == "device_registration": #에이전트 실행 시 최초 1회만 실행
+                response = requests.post(f"{self.backend_url}/api/v1/devices", json={"device_id": self.device_id, "device_url": self.device_url})
+        except Exception as e:
+            logger.warning("failed to send api: %s", e)
 
+        return response
+
+    def device_alive_check(self, data: str) -> None:
+        if data.startswith(("HELLO", "DATA", "ACK", "NACK")):
+            self.device_alive = True
 
     def device_loop(self) -> None:
+        '''
+        장치의 데이터를 읽어오고, 장치에게 CMD를 전송하는 메인 루프
+        '''
         while True:
             try:
                 if self.ser is None:
@@ -96,10 +120,43 @@ class SVAgent:
                     continue
                 logger.info("received data: %s", data)
 
-            except serial.SerialException:
+                self.device_alive_check(data)
+
+                # TODO CMD 처리하는 로직 만들기
+            except serial.SerialException: # 장비 연결이 끊어졌을 때 재연결을 시도하기 위한 예외처리
                 logger.warning("device connection lost")
                 self.close_device()
-                time.sleep(1) 
+                time.sleep(1)
+
+    def api_loop(self) -> None:
+        '''
+        백엔드로 보내는 API를 처리하는 루프
+        '''
+        heartbeat_hb = time.monotonic()
+        pending_hb = time.monotonic()
+
+        while True:
+            try:
+                now = time.monotonic()
+                if now - heartbeat_hb >= self.heartbeat_interval:
+                    if self.device_alive:
+                        response = self.send_api("device_heartbeat", None, None, None)
+                        if 200 <= response.status_code < 300:
+                            self.device_alive = False # 장치가 죽었다고 가정. 다음 하트비트 전송시기까지 여전히 죽어있으면 하트비트 못보내도록.
+                    heartbeat_hb = now
+                '''    # pending으로 인해 cmd가 실행되는 부분은 추후 테스트 및 구현
+                if now - pending_hb >= self.command_poll_interval: #하트비트 로직이 실행되는 타이밍에는 위 로직을 처리하고 해당 조건문으로 넘어오기 떄문에 완벽한 2초가 되지는 못한다. 
+                    response = self.send_api("pending", None, None, None)
+                    if response.status_code == 200:
+                        body = response.json()
+                        command_id = body if isinstance(body, list) else body.get("command_id", [])
+                        if command_id:
+                            self.cmd_queue.append(body)
+                    pending_hb = now
+                '''
+            except Exception as e:
+                logger.warning("api loop error: %s", e)
+            time.sleep(1)
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="현장 장비 에이전트")
@@ -116,10 +173,13 @@ def main() -> None:
 
     setup_logging(args.log_level)
     agent = SVAgent(load_config(Path(args.config)))
+    agent.send_api("device_registration", None, None, None)
 
     try:
-        threading.Thread(target=agent.device_loop, daemon=True).start()
-
+        threading.Thread(target=agent.device_loop, daemon=True).start() # 장치에 관한 루프를 스레드로 실행
+        threading.Thread(target=agent.api_loop, daemon=True).start() # API 루프를 스레드로 실행
+        while True:
+            time.sleep(1)
     except KeyboardInterrupt:
         logger.info("bye")
     finally:
