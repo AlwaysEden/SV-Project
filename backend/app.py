@@ -63,16 +63,17 @@ def register_device(body: DeviceRegister) -> dict[str, Any]:
 
 class HeartbeatIn(BaseModel):
     device_alive: bool
+    timestamp: float
 
 @app.post("/api/v1/devices/{device_id}/heartbeat")
 def device_heartbeat(device_id: str, body: HeartbeatIn) -> dict[str, Any]:
     now = time.time()
     with _lock:
         device = _require_device(device_id)
-        device["last_heartbeat_at"] = now
+        device["timestamp"] = body.timestamp
         device["device_alive"] = body.device_alive
-    logger.info("heartbeat %s alive=%s", device_id, body.device_alive)
-    return {"status": "ok", "device_alive": body.device_alive}
+    logger.info("heartbeat %s, alive=%s, timestamp=%s", device_id, body.device_alive, body.timestamp)
+    return {"status": "ok", "device_alive": body.device_alive, "timestamp": body.timestamp}
 
 
 
