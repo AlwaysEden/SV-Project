@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import threading
@@ -70,6 +71,15 @@ class SVAgent:
             msg[key] = value
         return msg
 
+    def make_telemetry_line(self, data: dict) -> list[dict]:
+        return [
+            {
+                "seq": int(data["seq"]),
+                "ts":datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "temperature": float(data["t"]),
+                "humidity": float(data["h"]),
+            }
+        ]
         
     def connect_device(self) -> None:
         try:  
@@ -91,15 +101,15 @@ class SVAgent:
         else:
             logger.warning("device is not connected")
 
-    def send_api(self, api: str, data: str, cmd_status: str, cmd_id: str) -> requests.Response:
+    def send_api(self, api: str, data: list[dict], cmd_status: str, cmd_id: str) -> requests.Response:
         response = None
         try:
             if api == "pending": #2초마다
                 response = requests.get(f"{self.backend_url}/api/v1/devices/{self.device_id}/commands/pending")
             elif api == "data_upload": #5초마다
-                response = requests.post(f"{self.backend_url}/api/v1/devices/{self.device_id}/telemetry", json={"data": data})
+                response = requests.post(f"{self.backend_url}/api/v1/devices/{self.device_id}/telemetry", json={"samples": data})
             elif api == "device_heartbeat": #10초마다
-                response = requests.post(f"{self.backend_url}/api/v1/devices/{self.device_id}/heartbeat", json={"device_alive": self.device_alive, "timestamp": time.time()})
+                response = requests.post(f"{self.backend_url}/api/v1/devices/{self.device_id}/heartbeat", json={"device_alive": self.device_alive, "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
             elif api == "cmd_send": #불특정하게
                 if cmd_status == "ACK" or cmd_status == "NACK":
                     response = requests.patch(f"{self.backend_url}/api/v1/commands/{cmd_id}", json={"status": cmd_status})
@@ -115,11 +125,24 @@ class SVAgent:
     def handle_data(self, data: str) -> None:
         if data.startswith(("HELLO", "DATA", "ACK", "NACK")):
             self.device_alive = True
+            if data.startswith("DATA"):
+                line = self.parse_data(data)
+                response = self.send_api("data_upload", self.make_telemetry_line(line), None, None)
+                body = response.json()
+                if response.status_code == 200:
+                    logger.info("DATA uploaded to Backend(accepted=%d)", body["accepted"])
+                else:
+                    logger.warning("Failed to upload DATA to Backend(seq=%d)", body["accepted"])
+
         if data.startswith(("ACK", "NACK")):
             line = self.parse_data(data)
+            for cmd in self.processing_pending_queue:
+                if cmd["command_id"] == line["id"]:
+                    self.processing_pending_queue.remove(cmd)
+                    break
+
             response = self.send_api("cmd_send", None, line["type"], line["id"])
             if response.status_code == 200:
-                self.processing_pending_queue.remove(cmd for cmd in self.processing_pending_queue if cmd["command_id"] == line["id"])
                 logger.info("ACK/NACK,%s(Agent->Backend)", line["id"])
             else:
                 logger.warning("Failed to send ACK/NACK,%s(Agent->Backend)", line["id"])
@@ -131,7 +154,7 @@ class SVAgent:
             self.ser.write(cmd["cmd_line"].encode("utf-8"))
             logger.info("CMD,%s(Agent->Device): %s", cmd["command_id"], cmd["cmd_line"])
             self.processing_pending_queue.append(cmd)
-            self.waiting_pending_queue.pop(0)
+            self.waiting_pending_queue.remove(cmd)
 
     def device_loop(self) -> None:
         '''
@@ -172,6 +195,9 @@ class SVAgent:
                         response = self.send_api("device_heartbeat", None, None, None)
                         if 200 <= response.status_code < 300:
                             self.device_alive = False # 장치가 죽었다고 가정. 다음 하트비트 전송시기까지 여전히 죽어있으면 하트비트 못보내도록.
+                            logger.info("HeartBeat sended.")
+                        else:
+                            logger.warning("HeartBeat failed.")
                     heartbeat_hb = now
 
                 if now - pending_hb >= self.command_poll_interval: #2초마다 대기중인 CMD 확인

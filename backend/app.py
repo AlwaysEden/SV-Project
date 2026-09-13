@@ -31,12 +31,12 @@ def _require_device(device_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="device not registered")
     return device
 
-class DeviceRegister(BaseModel):
+class DeviceRegistration(BaseModel):
     device_id: str
     device_url: str
 
 @app.post("/api/v1/devices", status_code=201)
-def register_device(body: DeviceRegister) -> dict[str, Any]:
+def register_device(body: DeviceRegistration) -> dict[str, Any]:
     now = time.time()
     with _lock:
         existing = devices.get(body.device_id)
@@ -61,12 +61,12 @@ def register_device(body: DeviceRegister) -> dict[str, Any]:
     return result
 
 
-class HeartbeatIn(BaseModel):
+class HeartbeatRequest(BaseModel):
     device_alive: bool
-    timestamp: float
+    timestamp: str
 
 @app.post("/api/v1/devices/{device_id}/heartbeat")
-def device_heartbeat(device_id: str, body: HeartbeatIn) -> dict[str, Any]:
+def device_heartbeat(device_id: str, body: HeartbeatRequest) -> dict[str, Any]:
     now = time.time()
     with _lock:
         device = _require_device(device_id)
@@ -85,7 +85,7 @@ def get_pending_commands(device_id: str) -> dict[str, Any]:
         # test용도
         import random
         rand_val = random.randint(0, 1)
-        rand_cmd_id = random.randint(1, 9999)
+        rand_cmd_id = str(random.randint(1, 9999))
         if rand_val == 1:
             pending = {"command_id": rand_cmd_id, "type": "SET_LED", "value": "on"}
         else:
@@ -102,6 +102,22 @@ class CommandUpdate(BaseModel):
 def update_command(command_id: str, body: CommandUpdate) -> dict[str, Any]:
     logger.info("command %s updated status=%s reason=%s", command_id, body.status, body.reason)
     return {"status": "ok", "status": body.status, "reason": body.reason if body.reason else None}
+
+class TelemetryRequest(BaseModel):
+    samples: list[dict]
+
+@app.post("/api/v1/devices/{device_id}/telemetry")
+def save_telemetry(device_id: str, body: TelemetryRequest) -> dict[str, Any]:
+    with _lock:
+        device = _require_device(device_id)
+
+        accepted = 0
+        for sample in body.samples: #현재는 DATA가 측정되자마자 1건씩 보내지만, 이후에 배치도 대응할 수 있도록 구현.
+            device["telemetry"].append(sample)
+            accepted += 1
+            logger.info("telemetry saved id=%s seq=%s", device_id, sample["seq"])
+
+    return {"accepted": accepted}
 
 if __name__ == "__main__":
     import uvicorn
