@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -23,15 +24,74 @@ logging.basicConfig(
 )
 
 COMMAND_STATUSES = ("PENDING", "ACK", "NACK", "FAILED")
+MONITOR_INTERVAL_SEC = 1.0
+
+_stop_monitor = threading.Event()
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     db.open_pool()
+
+    _stop_monitor.clear()
+    monitor = threading.Thread(target=_monitor_loop, name="heartbeat-monitor", daemon=True)
+    monitor.start()
+    logger.info("heartbeat monitor started interval=%ss", MONITOR_INTERVAL_SEC)
+
     try:
         yield
     finally:
+        _stop_monitor.set() # 스레드가 커넥션을 놓은 뒤에 풀을 닫아야 한다.
+        monitor.join(timeout=5)
+        logger.info("heartbeat monitor stopped")
         db.close_pool()
+
+def monitor_heartbeat(conn: psycopg.Connection) -> None:
+    """
+        하트비트가 끊긴 장치를 OFFLINE으로 내린다.
+    """
+    dead_heartbeat_interval = 30
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id FROM devices
+            WHERE last_heartbeat_time IS NOT NULL
+            AND status = 'ONLINE'
+            AND NOW() - last_heartbeat_time > (%s * INTERVAL '1 second') -- 하트비트 간격 초과 시 죽은 장치로 판단
+            """,
+            (dead_heartbeat_interval,),
+        )
+        rows = cur.fetchall()
+
+        for row in rows:
+            cur.execute( # 이벤트 로그 저장
+                """
+                INSERT INTO event_logs (device_id, type)
+                VALUES (%s, 'OFFLINE')
+                """,
+                (row["id"],),
+            )
+
+            cur.execute( # OFFLINE 상태로 변경
+                """
+                UPDATE devices SET status = 'OFFLINE' WHERE id = %s
+                """,
+                (row["id"],),
+            )
+
+            logger.info("device %s marked OFFLINE", row["id"])
+
+
+def _monitor_loop() -> None:
+    """모니터 스레드 본체. 한 틱이 실패해도 다음 주기로 넘어간다."""
+    while not _stop_monitor.is_set():
+        try:
+            with db.connection() as conn: # 틱마다 커넥션을 빌려 커밋한다.
+                monitor_heartbeat(conn)
+        except Exception:
+            logger.exception("heartbeat monitor tick failed")
+        _stop_monitor.wait(MONITOR_INTERVAL_SEC)
 
 
 app = FastAPI(title="SV Agent Backend", version="v1", lifespan=lifespan)
@@ -107,12 +167,44 @@ def device_heartbeat(
     heartbeat_at = _parse_ts(body.timestamp, "timestamp")
 
     with conn.cursor() as cur:
-        cur.execute(
-            "UPDATE devices SET last_heartbeat_time = %s WHERE id = %s",
-            (heartbeat_at, device_id),
+        cur.execute( # OFFLINE 상태였던 장치인지 확인
+            """
+            SELECT status FROM devices 
+            WHERE id = %s
+            """,
+            (device_id,),
         )
-        if cur.rowcount == 0:
-            raise HTTPException(status_code=404, detail="device not registered")
+        row = cur.fetchone()
+
+        if row is not None and row["status"] == "OFFLINE": #OFFLINE 상태 장치였다면,
+            cur.execute( # ONLINE 상태로 변경
+                """
+                UPDATE devices SET status = 'ONLINE', last_heartbeat_time = %s WHERE id = %s
+                """,
+                (heartbeat_at, device_id),
+            )
+            if cur.rowcount == 0: # 장치가 없다면 에러
+                raise HTTPException(status_code=404, detail="device not found")
+
+            try:
+                cur.execute( # 이벤트 로그 저장
+                    """
+                    INSERT INTO event_logs (device_id, type)
+                    VALUES (%s, 'ONLINE')
+                    """,
+                    (device_id,),
+                )
+            except pg_errors.Error as e:
+                raise HTTPException(status_code=409, detail=f"event log not saved: {e}") from None
+        elif row is not None and row["status"] == "ONLINE": # ONLINE 상태 장치였다면,
+            cur.execute( # 하트비트 시간 업데이트
+                "UPDATE devices SET last_heartbeat_time = %s WHERE id = %s",
+                (heartbeat_at, device_id),
+            )
+            if cur.rowcount == 0: # 장치가 없다면 에러
+                raise HTTPException(status_code=404, detail="device not found")
+        else: # 장치가 없다면 에러
+            raise HTTPException(status_code=404, detail="device not found")
 
     logger.info("heartbeat %s, alive=%s, timestamp=%s", device_id, body.device_alive, body.timestamp)
     return {"status": "ok", "device_alive": body.device_alive, "timestamp": body.timestamp}
@@ -181,7 +273,7 @@ class CommandCreate(BaseModel):
 def create_command(
     device_id: str,
     body: CommandCreate,
-    conn: psycopg.Connection = Depends(db.get_conn),
+    conn: psycopg.Connection = Depends(db.get_conn)
 ) -> dict[str, Any]:
     """콘솔이 명령을 생성한다. 에이전트는 pending 폴링으로 이 명령을 읽어간다."""
     _require_device(conn, device_id)
@@ -197,8 +289,8 @@ def create_command(
                 """,
                 (cmd_id, device_id, body.source, body.type, body.value),
             )
-        except pg_errors.UniqueViolation:
-            raise HTTPException(status_code=409, detail="command id already exists") from None
+        except pg_errors.Error as e:
+            raise HTTPException(status_code=500, detail=f"command not saved: {e}") from None
 
     logger.info("command created %s device=%s %s=%s", cmd_id, device_id, body.type, body.value)
     return {
@@ -271,12 +363,6 @@ def update_command(
 
     logger.info("command %s updated status=%s reason=%s", command_id, row["status"], row["reason"])
     return {"status": row["status"], "reason": row["reason"]}
-
-
-#TODO: def monitor_heartbeat
-
-
-
 
 if __name__ == "__main__":
     import uvicorn
