@@ -6,8 +6,8 @@
 |---|---|
 | 장치 | 시뮬레이터. HELLO / DATA / ACK / NACK 송신, CMD 수신 |
 | 에이전트 | `svagent.py`. 시리얼과 백엔드 REST를 중계 |
-| 백엔드 | `backend/app.py`. 등록, 하트비트, 텔레메트리, pending, 명령 상태 |
-| 콘솔 | 운영자. 명령 생성, 상태 조회 (평가·제어 포함) |
+| 백엔드 | `backend/app.py`. 등록, 하트비트, 텔레메트리, pending, 명령 상태, 임계치 규칙 |
+| 콘솔 | 운영자. 명령 생성, 임계치 설정, 상태 조회 (평가·제어 포함) |
 
 ---
 
@@ -82,6 +82,7 @@ sequenceDiagram
 
     Agent->>Backend: POST /api/v1/devices/{id}/heartbeat
     Backend-->>Agent: 200 {status, device_alive, timestamp}
+    Note over Backend: 하트비트가 30초 동안 없을 때 Offline판정 로직
 ```
 
 ---
@@ -106,6 +107,27 @@ sequenceDiagram
     Device-->>Agent: ACK/NACK 응답 or 3초간 무응답
     Agent-->>Backend: 결과보고(무응답은 FAILED로 보고)
     Backend-->>Agent: 200 {status, reason}
+    Note over Backend: 명령 상태 전이
+```
+
+---
+
+## 6. 임계치 규칙
+
+콘솔이 장치별 온도 임계치를 저장한다. `last_action` 기본값은 `OFF`.
+백엔드는 텔레메트리가 올 떄마다 이 임계치를 기준으로 규칙판정을 한다. 임계치 이상이면 LED OFF, 이하면 LED ON 명령.
+다만, 중복명령이 되지 않도록 이전 명령을 기억한다. 명령전달은 위 5번을 통해서 진행.
+
+```mermaid
+sequenceDiagram
+    participant Device as 장치
+    participant Agent as 에이전트
+    participant Backend as 백엔드
+    actor Console as 콘솔
+
+    Console->>Backend: PUT /api/v1/devices/{id}/rules {threshold}
+    Backend-->>Console: 200 {threshold}
+    Note over Backend: rules UPSERT (device_id, threshold)
 ```
 
 ---
