@@ -147,6 +147,12 @@ class SVAgent:
             else:
                 logger.warning("Failed to send ACK/NACK,%s(Agent->Backend)", line["id"])
 
+    def has_command(self, command_id: str) -> bool:
+        for cmd in self.waiting_pending_queue + self.processing_pending_queue:
+            if cmd["command_id"] == command_id:
+                return True
+        return False
+
     def flush_cmd_queue(self) -> None:
 
         for cmd in self.waiting_pending_queue:
@@ -185,7 +191,6 @@ class SVAgent:
         '''
         heartbeat_hb = time.monotonic()
         pending_hb = time.monotonic()
-        cmd_queue = None
 
         while True:
             try:
@@ -203,14 +208,14 @@ class SVAgent:
                 if now - pending_hb >= self.command_poll_interval: #2초마다 대기중인 CMD 확인
                     response = self.send_api("pending", None, None, None)
                     if response.status_code == 200:
-                        body = response.json()
-                        if body:
-                            cmd_queue = {
-                                "command_id": body["command_id"],
-                                "cmd_line": f"CMD,id={body['command_id']},led={0 if body['value'] == 'off' else 1}\n",
+                        for cmd in response.json(): # 대기중인 CMD 전건이 오므로, 이미 처리중인 CMD는 건너뛴다.
+                            if self.has_command(cmd["command_id"]):
+                                continue
+                            self.waiting_pending_queue.append({
+                                "command_id": cmd["command_id"],
+                                "cmd_line": f"CMD,id={cmd['command_id']},led={0 if cmd['value'] == 'off' else 1}\n",
                                 "deadline": ""
-                            }
-                            self.waiting_pending_queue.append(cmd_queue)
+                            })
                     pending_hb = now
                 for cmd in self.processing_pending_queue: # FIFO로 CMD를 전송했어도, 응답은 순서대로 오지 않을 수 있기에 모든 CMD에 대해 타임아웃 검사 및 처리
                     deadline = cmd.get("deadline")
