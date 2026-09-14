@@ -118,7 +118,7 @@ class SVAgent:
             elif api == "device_registration": #에이전트 실행 시 최초 1회만 실행
                 response = requests.post(f"{self.backend_url}/api/v1/devices", json={"device_id": self.device_id, "device_url": self.device_url})
         except Exception as e:
-            logger.warning("Fail to send API from Agent to Backend")
+            logger.warning("Fail to send API from Agent to Backend: %s", e)
 
         return response
 
@@ -143,9 +143,9 @@ class SVAgent:
 
             response = self.send_api("cmd_send", None, line["type"], line["id"])
             if response.status_code == 200:
-                logger.info("ACK/NACK,%s(Agent->Backend)", line["id"])
+                logger.info("%s sent to Backend(id=%s).", line["type"], line["id"])
             else:
-                logger.warning("Failed to send ACK/NACK,%s(Agent->Backend)", line["id"])
+                logger.warning("Failed to send %s to Backend(id=%s).", line["type"], line["id"])
 
     def has_command(self, command_id: str) -> bool:
         for cmd in self.waiting_pending_queue + self.processing_pending_queue:
@@ -158,7 +158,7 @@ class SVAgent:
         for cmd in self.waiting_pending_queue:
             cmd["deadline"] = time.monotonic() + self.device_ack_timeout
             self.ser.write(cmd["cmd_line"].encode("utf-8"))
-            logger.info("CMD,%s(Agent->Device): %s", cmd["command_id"], cmd["cmd_line"])
+            logger.info("CMD sent to Device(cmd_id=%s): %s", cmd["command_id"], cmd["cmd_line"])
             self.processing_pending_queue.append(cmd)
             self.waiting_pending_queue.remove(cmd)
 
@@ -223,7 +223,7 @@ class SVAgent:
                         response = self.send_api("cmd_send", None, "FAILED", cmd["command_id"])
                         self.processing_pending_queue.remove(cmd)
                         if response is not None and response.status_code == 200:
-                            logger.warning("CMD timeout,%s(Agent->Backend)", cmd["command_id"])
+                            logger.warning("CMD timeout(cmd_id=%s).", cmd["command_id"])
 
             except Exception as e:
                 logger.warning("API loop error: %s", e)
