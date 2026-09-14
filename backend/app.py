@@ -28,7 +28,6 @@ MONITOR_INTERVAL_SEC = 1.0
 
 _stop_monitor = threading.Event()
 
-
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     db.open_pool()
@@ -36,15 +35,23 @@ async def lifespan(_app: FastAPI):
     _stop_monitor.clear()
     monitor = threading.Thread(target=_monitor_loop, name="heartbeat-monitor", daemon=True)
     monitor.start()
-    logger.info("heartbeat monitor started interval=%ss", MONITOR_INTERVAL_SEC)
+    logger.info("heartbeat_monitor_started interval=%ss", MONITOR_INTERVAL_SEC)
 
     try:
         yield
     finally:
         _stop_monitor.set() # 스레드가 커넥션을 놓은 뒤에 풀을 닫아야 한다.
         monitor.join(timeout=5)
-        logger.info("heartbeat monitor stopped")
+        logger.info("heartbeat_monitor_stopped")
         db.close_pool()
+        
+app = FastAPI(title="SV Agent Backend", version="v1", lifespan=lifespan)
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+
 
 def monitor_heartbeat(conn: psycopg.Connection) -> None:
     """
@@ -80,7 +87,7 @@ def monitor_heartbeat(conn: psycopg.Connection) -> None:
                 (row["id"],),
             )
 
-            logger.info("device %s marked OFFLINE", row["id"])
+            logger.info("device_offline device=%s", row["id"])
 
 
 def _monitor_loop() -> None:
@@ -90,16 +97,8 @@ def _monitor_loop() -> None:
             with db.connection() as conn: # 틱마다 커넥션을 빌려 커밋한다.
                 monitor_heartbeat(conn)
         except Exception:
-            logger.exception("heartbeat monitor tick failed")
+            logger.exception("heartbeat_monitor_tick_failed")
         _stop_monitor.wait(MONITOR_INTERVAL_SEC)
-
-
-app = FastAPI(title="SV Agent Backend", version="v1", lifespan=lifespan)
-
-
-@app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
 
 
 def _require_device(conn: psycopg.Connection, device_id: str) -> None:
@@ -124,6 +123,7 @@ class DeviceRegistration(BaseModel):
     device_id: str = Field(max_length=10)
     device_url: str = Field(max_length=50)
 
+# 에이전트 send_api 별명: device_registration
 @app.post("/api/v1/devices", status_code=201)
 def register_device(
     body: DeviceRegistration,
@@ -145,9 +145,9 @@ def register_device(
         row = cur.fetchone()
 
     if existing:
-        logger.info("re-registered %s url=%s", row["id"], row["url"])
+        logger.info("device_re_registered device=%s url=%s", row["id"], row["url"])
     else:
-        logger.info("registered %s url=%s", row["id"], row["url"])
+        logger.info("device_registered device=%s url=%s", row["id"], row["url"])
 
     return {"device_id": row["id"], "device_url": row["url"]}
 
@@ -156,6 +156,7 @@ class HeartbeatRequest(BaseModel):
     device_alive: bool
     timestamp: str
 
+# 에이전트 send_api 별명: device_heartbeat
 @app.post("/api/v1/devices/{device_id}/heartbeat")
 def device_heartbeat(
     device_id: str,
@@ -195,8 +196,9 @@ def device_heartbeat(
                     """,
                     (device_id,),
                 )
-            except pg_errors.Error as e:
-                raise HTTPException(status_code=409, detail=f"event log not saved: {e}") from None
+            except pg_errors.Error: # 상세는 로그에만 남긴다. DB 제약 조건명이 응답으로 나가지 않게 한다.
+                logger.exception("event_log_insert_failed device=%s type=ONLINE", device_id)
+                raise HTTPException(status_code=500, detail="event log not saved") from None
         elif row is not None and row["status"] == "ONLINE": # ONLINE 상태 장치였다면,
             cur.execute( # 하트비트 시간 업데이트
                 "UPDATE devices SET last_heartbeat_time = %s WHERE id = %s",
@@ -205,29 +207,34 @@ def device_heartbeat(
         else: # 장치가 없다면 에러
             raise HTTPException(status_code=404, detail="device not found")
 
-    logger.info("heartbeat %s, alive=%s, timestamp=%s", device_id, body.device_alive, body.timestamp)
+    logger.debug("heartbeat device=%s alive=%s timestamp=%s", device_id, body.device_alive, body.timestamp)
     return {"status": "ok", "device_alive": body.device_alive, "timestamp": body.timestamp}
 
 
+class TelemetrySample(BaseModel):
+    """샘플 하나. 필드 누락과 타입 오류는 Pydantic이 422로 거절한다."""
+    seq: int
+    ts: datetime
+    temperature: float
+    humidity: float
+
+
 class TelemetryRequest(BaseModel):
-    samples: list[dict]
+    samples: list[TelemetrySample] = Field(min_length=1)
 
     def prepare_telemetry_rows(
         self,
-    ) -> tuple[list[dict], dict | None]:
+    ) -> tuple[list[dict], TelemetrySample | None]:
 
         rows = []
         latest = None
         for sample in self.samples:
-            missing = [k for k in ("seq", "ts", "temperature", "humidity") if k not in sample]
-            if missing:
-                raise ValueError("sample missing keys: %s" % ", ".join(missing))
             rows.append(
                 {
-                    "seq": sample["seq"],
-                    "temperature": sample["temperature"],
-                    "humidity": sample["humidity"],
-                    "ts": _parse_ts(sample["ts"], "ts"),
+                    "seq": sample.seq,
+                    "temperature": sample.temperature,
+                    "humidity": sample.humidity,
+                    "ts": sample.ts,
                 }
             )
             latest = sample
@@ -239,7 +246,7 @@ class TelemetryRequest(BaseModel):
         conn: psycopg.Connection,
         device_id: str,
         rows: list[dict],
-        latest: dict | None,
+        latest: TelemetrySample | None,
     ) -> int:
         with conn.cursor() as cur:
             for row in rows:
@@ -257,10 +264,11 @@ class TelemetryRequest(BaseModel):
                     SET latest_temperature = %s, latest_humidity = %s
                     WHERE id = %s
                     """,
-                    (latest["temperature"], latest["humidity"], device_id),
+                    (latest.temperature, latest.humidity, device_id),
                 )
         return len(rows)
 
+# 에이전트 send_api 별명: data_upload
 @app.post("/api/v1/devices/{device_id}/telemetry")
 def save_telemetry(
     device_id: str,
@@ -268,20 +276,27 @@ def save_telemetry(
     conn: psycopg.Connection = Depends(db.get_conn),
 ) -> dict[str, Any]:
     _require_device(conn, device_id)
-    try:
-        rows, latest = body.prepare_telemetry_rows()
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from None
+    rows, latest = body.prepare_telemetry_rows()
     accepted = body.insert_telemetry(conn, device_id, rows, latest)
-    logger.info("telemetry saved device=%s accepted=%d", device_id, accepted)
+    logger.debug("telemetry_saved device=%s accepted=%d", device_id, accepted)
 
     check_threshold(conn, device_id, latest)
     return {"accepted": accepted}
 
-def check_threshold(conn: psycopg.Connection, device_id: str, latest: dict) -> None:
+def check_threshold(conn: psycopg.Connection, device_id: str, latest: TelemetrySample | None) -> None:
+    """
+        임계치 규칙을 평가해 자동 명령을 만든다.
+        규칙 처리 실패가 이미 저장된 텔레메트리를 되돌리지 않도록 저장점 안에서 실행한다.
+    """
+    if latest is None:
+        return
+
     last_action = None
+    command = None
     try:
-        with conn.cursor() as cur:
+        # check_threshold함수의 실패가 insert_telemetry에 영향을 주지 않도록 
+        # 중첩 transaction()이 SAVEPOINT를 만들어서, 여기서 실패해도 텔레메트리 INSERT는 커밋된다.
+        with conn.transaction(), conn.cursor() as cur:
             cur.execute(
                 """
                 SELECT threshold, last_action FROM rules WHERE device_id = %s
@@ -291,20 +306,21 @@ def check_threshold(conn: psycopg.Connection, device_id: str, latest: dict) -> N
             row = cur.fetchone()
             if row is not None:
             
-                if latest["temperature"] < row["threshold"] and row["last_action"] == "ON":
+                if latest.temperature < row["threshold"] and row["last_action"] == "ON":
                     body = CommandCreate(type="SET_LED", value="off", source="rule")
                     command = body.insert_command(conn, device_id)
                     last_action = "OFF"
-                    logger.info("auto-command created %s device=%s %s=%s", command["command_id"], device_id, command["type"], command["value"])
-                elif latest["temperature"] > row["threshold"] and row["last_action"] == "OFF":
+                elif latest.temperature > row["threshold"] and row["last_action"] == "OFF":
                     body = CommandCreate(type="SET_LED", value="on", source="rule")
                     command = body.insert_command(conn, device_id)
                     last_action = "ON"
-                    logger.info("auto-command created %s device=%s %s=%s", command["command_id"], device_id, command["type"], command["value"])
                 else:
                     #do nothing
                     pass
-                
+
+                if command is not None:
+                    logger.info("rule_command_created cmd_id=%s device=%s %s=%s", command["command_id"], device_id, command["type"], command["value"])
+
                 if last_action is not None:
                     cur.execute(
                         """
@@ -312,10 +328,11 @@ def check_threshold(conn: psycopg.Connection, device_id: str, latest: dict) -> N
                         """,
                         (last_action, device_id),
                     )
-                    if cur.rowcount == 0:
-                        raise HTTPException(status_code=500, detail="last_action not updated")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from None
+                    if cur.rowcount == 0: # 응답 코드가 아닌 내부 불변식 위반이므로 저장점만 되돌린다.
+                        raise RuntimeError("last_action not updated device=%s" % device_id)
+    except Exception:
+        # 규칙 평가는 텔레메트리 수집의 부가 기능이다. 실패해도 수집은 성공으로 응답한다.
+        logger.exception("rule_evaluation_failed device=%s", device_id)
 
 class CommandCreate(BaseModel):
     type: str = Field(max_length=20)
@@ -334,8 +351,9 @@ class CommandCreate(BaseModel):
                 """,
                 (cmd_id, device_id, self.source, self.type, self.value),
             )
-            except pg_errors.Error as e:
-                raise HTTPException(status_code=500, detail=f"command not saved: {e}") from None
+            except pg_errors.Error:
+                logger.exception("command_insert_failed device=%s type=%s", device_id, self.type)
+                raise HTTPException(status_code=500, detail="command not saved") from None
         return {
             "command_id": cmd_id,
             "device_id": device_id,
@@ -355,10 +373,11 @@ def create_command(
     _require_device(conn, device_id)
 
     command = body.insert_command(conn, device_id)
-    logger.info("command created %s device=%s %s=%s", command["command_id"], device_id, command["type"], command["value"])
+    logger.info("command_created cmd_id=%s device=%s %s=%s", command["command_id"], device_id, command["type"], command["value"])
     return command
 
 
+# 에이전트 send_api 별명: pending
 @app.get("/api/v1/devices/{device_id}/commands/pending")
 def get_pending_commands(
     device_id: str,
@@ -379,7 +398,11 @@ def get_pending_commands(
         )
         rows = cur.fetchall()
 
-    logger.info("pending %s count=%d", device_id, len(rows))
+    # 2초마다 폴링되므로 대기 명령이 없는 응답은 DEBUG로 내린다.
+    logger.log(
+        logging.INFO if rows else logging.DEBUG,
+        "pending_polled device=%s count=%d", device_id, len(rows),
+    )
     return [
         {"command_id": row["cmd_id"], "type": row["type"], "value": row["value"]}
         for row in rows
@@ -390,6 +413,7 @@ class CommandUpdate(BaseModel):
     status: str
     reason: str | None = Field(default=None, max_length=500)
 
+# 에이전트 send_api 별명: cmd_send (ACK / NACK / FAILED)
 @app.patch("/api/v1/commands/{command_id}")
 def update_command(
     command_id: str,
@@ -417,7 +441,7 @@ def update_command(
     if row is None:
         raise HTTPException(status_code=404, detail="command not found")
 
-    logger.info("command %s updated status=%s reason=%s", command_id, row["status"], row["reason"])
+    logger.info("command_updated cmd_id=%s status=%s reason=%s", command_id, row["status"], row["reason"])
     return {"status": row["status"], "reason": row["reason"]}
 
 class ThresholdRule(BaseModel):
@@ -442,11 +466,13 @@ def update_threshold_rule(
                 """,
                 (device_id, body.threshold),
             )
+        # ON CONFLICT DO UPDATE ... RETURNING은 삽입이든 갱신이든 항상 행을 반환해야한다.
         row = cur.fetchone()
-        if row is None:
-            raise HTTPException(status_code=404, detail="rule not found")
 
-    return {"threshold": body.threshold}
+    # NUMERIC은 Decimal로 돌아오므로 float로 변환한다. 그냥 담으면 JSON에 문자열로 나간다.
+    threshold = float(row["threshold"])
+    logger.info("rule_updated device=%s threshold=%s", device_id, threshold)
+    return {"threshold": threshold}
 
 
 

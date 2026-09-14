@@ -31,7 +31,7 @@ def open_pool() -> None:
         open=True,
     )
     _pool.wait()
-    logger.info("db pool opened host=%s", DATABASE_URL.rsplit("@", 1)[-1])
+    logger.info("db_pool_opened host=%s", DATABASE_URL.rsplit("@", 1)[-1])
 
 
 def close_pool() -> None:
@@ -39,7 +39,7 @@ def close_pool() -> None:
     if _pool is not None:
         _pool.close()
         _pool = None
-        logger.info("db pool closed")
+        logger.info("db_pool_closed")
 
 
 def connection() -> ContextManager[psycopg.Connection]:
