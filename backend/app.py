@@ -186,8 +186,6 @@ def device_heartbeat(
                 """,
                 (heartbeat_at, device_id),
             )
-            if cur.rowcount == 0: # 장치가 없다면 에러
-                raise HTTPException(status_code=404, detail="device not found")
 
             try:
                 cur.execute( # 이벤트 로그 저장
@@ -204,8 +202,6 @@ def device_heartbeat(
                 "UPDATE devices SET last_heartbeat_time = %s WHERE id = %s",
                 (heartbeat_at, device_id),
             )
-            if cur.rowcount == 0: # 장치가 없다면 에러
-                raise HTTPException(status_code=404, detail="device not found")
         else: # 장치가 없다면 에러
             raise HTTPException(status_code=404, detail="device not found")
 
@@ -277,15 +273,77 @@ def save_telemetry(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from None
     accepted = body.insert_telemetry(conn, device_id, rows, latest)
+    logger.info("telemetry saved device=%s accepted=%d", device_id, accepted)
 
+    check_threshold(conn, device_id, latest)
     return {"accepted": accepted}
 
+def check_threshold(conn: psycopg.Connection, device_id: str, latest: dict) -> None:
+    last_action = None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT threshold, last_action FROM rules WHERE device_id = %s
+                """,
+                (device_id,),
+            )
+            row = cur.fetchone()
+            if row is not None:
+            
+                if latest["temperature"] < row["threshold"] and row["last_action"] == "ON":
+                    body = CommandCreate(type="SET_LED", value="off", source="rule")
+                    command = body.insert_command(conn, device_id)
+                    last_action = "OFF"
+                    logger.info("auto-command created %s device=%s %s=%s", command["command_id"], device_id, command["type"], command["value"])
+                elif latest["temperature"] > row["threshold"] and row["last_action"] == "OFF":
+                    body = CommandCreate(type="SET_LED", value="on", source="rule")
+                    command = body.insert_command(conn, device_id)
+                    last_action = "ON"
+                    logger.info("auto-command created %s device=%s %s=%s", command["command_id"], device_id, command["type"], command["value"])
+                else:
+                    #do nothing
+                    pass
+                
+                if last_action is not None:
+                    cur.execute(
+                        """
+                        UPDATE rules SET last_action = %s WHERE device_id = %s
+                        """,
+                        (last_action, device_id),
+                    )
+                    if cur.rowcount == 0:
+                        raise HTTPException(status_code=500, detail="last_action not updated")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from None
 
 class CommandCreate(BaseModel):
     type: str = Field(max_length=20)
     value: str = Field(max_length=10)
     source: str = Field(default="console", max_length=10)
     cmd_id: str | None = Field(default=None, max_length=20)
+
+    def insert_command(self, conn: psycopg.Connection, device_id: str) -> None:
+        cmd_id = uuid.uuid4().hex[:16]
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                """
+                INSERT INTO commands (cmd_id, device_id, source, type, value, status)
+                VALUES (%s, %s, %s, %s, %s, 'PENDING')
+                """,
+                (cmd_id, device_id, self.source, self.type, self.value),
+            )
+            except pg_errors.Error as e:
+                raise HTTPException(status_code=500, detail=f"command not saved: {e}") from None
+        return {
+            "command_id": cmd_id,
+            "device_id": device_id,
+            "source": self.source,
+            "type": self.type,
+            "value": self.value,
+            "status": "PENDING",
+        }
 
 @app.post("/api/v1/devices/{device_id}/commands", status_code=201)
 def create_command(
@@ -296,29 +354,9 @@ def create_command(
     """콘솔이 명령을 생성한다. 에이전트는 pending 폴링으로 이 명령을 읽어간다."""
     _require_device(conn, device_id)
 
-    cmd_id = body.cmd_id or uuid.uuid4().hex[:16]
-
-    with conn.cursor() as cur:
-        try:
-            cur.execute(
-                """
-                INSERT INTO commands (cmd_id, device_id, source, type, value, status)
-                VALUES (%s, %s, %s, %s, %s, 'PENDING')
-                """,
-                (cmd_id, device_id, body.source, body.type, body.value),
-            )
-        except pg_errors.Error as e:
-            raise HTTPException(status_code=500, detail=f"command not saved: {e}") from None
-
-    logger.info("command created %s device=%s %s=%s", cmd_id, device_id, body.type, body.value)
-    return {
-        "command_id": cmd_id,
-        "device_id": device_id,
-        "source": body.source,
-        "type": body.type,
-        "value": body.value,
-        "status": "PENDING",
-    }
+    command = body.insert_command(conn, device_id)
+    logger.info("command created %s device=%s %s=%s", command["command_id"], device_id, command["type"], command["value"])
+    return command
 
 
 @app.get("/api/v1/devices/{device_id}/commands/pending")
@@ -381,6 +419,36 @@ def update_command(
 
     logger.info("command %s updated status=%s reason=%s", command_id, row["status"], row["reason"])
     return {"status": row["status"], "reason": row["reason"]}
+
+class ThresholdRule(BaseModel):
+    threshold: float = Field(ge=0.0, le=100.0) # 0.0 ~ 100.0
+
+@app.put("/api/v1/devices/{device_id}/rules")
+def update_threshold_rule(
+    device_id: str,
+    body: ThresholdRule,
+    conn: psycopg.Connection = Depends(db.get_conn),
+) -> dict[str, Any]:
+
+    _require_device(conn, device_id)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+                INSERT INTO rules (device_id, threshold)
+                VALUES (%s, %s)
+                ON CONFLICT (device_id) DO UPDATE SET threshold = EXCLUDED.threshold
+                RETURNING threshold
+                """,
+                (device_id, body.threshold),
+            )
+        row = cur.fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="rule not found")
+
+    return {"threshold": body.threshold}
+
+
 
 if __name__ == "__main__":
     import uvicorn

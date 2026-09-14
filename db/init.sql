@@ -35,7 +35,7 @@ CREATE TABLE commands (
 
 CREATE TABLE rules (
     device_id VARCHAR(10) PRIMARY KEY,
-    threshold NUMERIC(4,1),
+    threshold NUMERIC(4,1) NOT NULL,
     last_action VARCHAR(3) NOT NULL DEFAULT 'OFF'
         CHECK (last_action IN ('ON', 'OFF')),
     updated_at TIMESTAMPTZ

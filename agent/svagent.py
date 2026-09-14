@@ -120,6 +120,7 @@ class SVAgent:
         except Exception as e:
             logger.warning("Fail to send API from Agent to Backend: %s", e)
 
+
         return response
 
     def handle_data(self, data: str) -> None:
@@ -128,11 +129,14 @@ class SVAgent:
             if data.startswith("DATA"):
                 line = self.parse_data(data)
                 response = self.send_api("data_upload", self.make_telemetry_line(line), None, None)
-                body = response.json()
+                if response is None:
+                    logger.warning("Failed to upload DATA to Backend(no response)")
+                    return
                 if response.status_code == 200:
+                    body = response.json()
                     logger.info("DATA uploaded to Backend(accepted=%d)", body["accepted"])
                 else:
-                    logger.warning("Failed to upload DATA to Backend(seq=%d)", body["accepted"])
+                    logger.warning("Failed to upload DATA to Backend")
 
         if data.startswith(("ACK", "NACK")):
             line = self.parse_data(data)
