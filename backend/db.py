@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Iterator
+from typing import ContextManager
 
 import psycopg
 from psycopg.rows import dict_row
@@ -41,10 +42,18 @@ def close_pool() -> None:
         logger.info("db pool closed")
 
 
-def get_conn() -> Iterator[psycopg.Connection]:
-    """요청 하나에 커넥션 하나. 정상 종료면 commit, 예외면 rollback."""
+def connection() -> ContextManager[psycopg.Connection]:
+    """
+        요청 밖(백그라운드 루프 등)에서 커넥션을 빌린다.
+        with 블록이 끝나면 commit, 예외면 rollback.
+    """
     if _pool is None:
         raise RuntimeError("db pool is not initialized")
 
-    with _pool.connection() as conn:
+    return _pool.connection()
+
+
+def get_conn() -> Iterator[psycopg.Connection]:
+    """요청 하나에 커넥션 하나. 정상 종료면 commit, 예외면 rollback."""
+    with connection() as conn:
         yield conn

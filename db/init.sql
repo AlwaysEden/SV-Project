@@ -1,6 +1,8 @@
 CREATE TABLE devices (
     id VARCHAR(10) PRIMARY KEY,
     url VARCHAR(50) NOT NULL,
+    status VARCHAR(10) NOT NULL DEFAULT 'OFFLINE'
+        CHECK (status IN ('ONLINE', 'OFFLINE')),
     latest_temperature NUMERIC(4,1),
     latest_humidity NUMERIC(4,1),
     last_heartbeat_time TIMESTAMPTZ,
@@ -37,6 +39,14 @@ CREATE TABLE rules (
     last_action VARCHAR(3) NOT NULL DEFAULT 'OFF'
         CHECK (last_action IN ('ON', 'OFF')),
     updated_at TIMESTAMPTZ
+);
+
+CREATE TABLE event_logs(
+    seq BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    device_id VARCHAR(10) NOT NULL,
+    type VARCHAR(10) NOT NULL
+        CHECK (type IN ('ONLINE', 'OFFLINE')),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE INDEX idx_telemetry_device_time
