@@ -117,7 +117,7 @@ def _parse_ts(value: str, field: str) -> datetime:
     try:
         return datetime.fromisoformat(value)
     except ValueError:
-        raise HTTPException(status_code=400, detail=f"invalid {field}: {value}") from None
+        raise ValueError(f"invalid {field}: {value}") from None
 
 
 class DeviceRegistration(BaseModel):
@@ -164,7 +164,10 @@ def device_heartbeat(
 ) -> dict[str, Any]:
     # device_alive는 저장하지 않는다. 에이전트는 장치가 살아있을 때만 하트비트를 보내므로
     # last_heartbeat_time 만으로 Offline 판정이 가능하다.
-    heartbeat_at = _parse_ts(body.timestamp, "timestamp")
+    try:
+        heartbeat_at = _parse_ts(body.timestamp, "timestamp")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from None
 
     with conn.cursor() as cur:
         cur.execute( # OFFLINE 상태였던 장치인지 확인
@@ -213,6 +216,55 @@ def device_heartbeat(
 class TelemetryRequest(BaseModel):
     samples: list[dict]
 
+    def prepare_telemetry_rows(
+        self,
+    ) -> tuple[list[dict], dict | None]:
+
+        rows = []
+        latest = None
+        for sample in self.samples:
+            missing = [k for k in ("seq", "ts", "temperature", "humidity") if k not in sample]
+            if missing:
+                raise ValueError("sample missing keys: %s" % ", ".join(missing))
+            rows.append(
+                {
+                    "seq": sample["seq"],
+                    "temperature": sample["temperature"],
+                    "humidity": sample["humidity"],
+                    "ts": _parse_ts(sample["ts"], "ts"),
+                }
+            )
+            latest = sample
+
+        return rows, latest
+    
+    def insert_telemetry(
+        self,
+        conn: psycopg.Connection,
+        device_id: str,
+        rows: list[dict],
+        latest: dict | None,
+    ) -> int:
+        with conn.cursor() as cur:
+            for row in rows:
+                cur.execute(
+                    """
+                    INSERT INTO telemetry (device_id, seq, temperature, humidity, ts)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (device_id, row["seq"], row["temperature"], row["humidity"], row["ts"])
+                )
+            if latest is not None:
+                cur.execute(
+                    """
+                    UPDATE devices
+                    SET latest_temperature = %s, latest_humidity = %s
+                    WHERE id = %s
+                    """,
+                    (latest["temperature"], latest["humidity"], device_id),
+                )
+        return len(rows)
+
 @app.post("/api/v1/devices/{device_id}/telemetry")
 def save_telemetry(
     device_id: str,
@@ -220,45 +272,11 @@ def save_telemetry(
     conn: psycopg.Connection = Depends(db.get_conn),
 ) -> dict[str, Any]:
     _require_device(conn, device_id)
-
-    accepted = 0
-    latest: dict[str, Any] | None = None
-
-    with conn.cursor() as cur:
-        for sample in body.samples: #현재는 DATA가 측정되자마자 1건씩 보내지만, 이후에 배치도 대응할 수 있도록 구현.
-            missing = [k for k in ("seq", "ts", "temperature", "humidity") if k not in sample]
-            if missing:
-                raise HTTPException(
-                    status_code=400,
-                    detail="sample missing keys: %s" % ", ".join(missing),
-                )
-
-            cur.execute(
-                """
-                INSERT INTO telemetry (device_id, seq, temperature, humidity, ts)
-                VALUES (%s, %s, %s, %s, %s)
-                """,
-                (
-                    device_id,
-                    sample["seq"],
-                    sample["temperature"],
-                    sample["humidity"],
-                    _parse_ts(sample["ts"], "ts"),
-                ),
-            )
-            accepted += 1
-            latest = sample
-            logger.info("telemetry saved id=%s seq=%s", device_id, sample["seq"])
-
-        if latest is not None: # 콘솔 조회용 최신값 캐시. 이력은 telemetry가 담당한다.
-            cur.execute(
-                """
-                UPDATE devices
-                SET latest_temperature = %s, latest_humidity = %s
-                WHERE id = %s
-                """,
-                (latest["temperature"], latest["humidity"], device_id),
-            )
+    try:
+        rows, latest = body.prepare_telemetry_rows()
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from None
+    accepted = body.insert_telemetry(conn, device_id, rows, latest)
 
     return {"accepted": accepted}
 
