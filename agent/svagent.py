@@ -18,15 +18,20 @@ logger = logging.getLogger("svagent")
 
 
 def setup_logging(level: str) -> None:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter(
+        fmt="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%SZ",
+    )
+    formatter.converter = time.gmtime  # API 가 보내는 Z 시각과 맞춘다.
+    handler.setFormatter(formatter)
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[handler],
     )
 
 
 def api_ok(response: requests.Response | None) -> bool:
-    """전송 실패(None)와 비2xx 응답을 한 번에 걸러낸다. 실패 로그는 send_api가 남긴다."""
     return response is not None and 200 <= response.status_code < 300
 
 
@@ -61,15 +66,15 @@ def load_config(path: Path) -> dict:
 
 class SVAgent:
     def __init__(self, cfg: dict):
-        self.device_id = cfg["device_id"]
-        self.device_url = cfg["device_url"]
-        self.backend_url = cfg["backend_url"].rstrip("/")
-        self.heartbeat_interval = float(cfg["heartbeat_interval_sec"])
-        self.command_poll_interval = float(cfg["command_poll_interval_sec"])
-        self.device_ack_timeout = float(cfg["device_ack_timeout_sec"])
-        self.device_alive = False
-        self.ser: serial.Serial | None = None
-        self.waiting_pending_queue: list[dict] = [] # 백엔드에서 대기중인 CMD를 읽어온 후 아직 장치에게 전송하지 않은 CMD 목록
+        self.device_id                            = cfg["device_id"]
+        self.device_url                           = cfg["device_url"]
+        self.backend_url                          = cfg["backend_url"].rstrip("/")
+        self.heartbeat_interval                   = float(cfg["heartbeat_interval_sec"])
+        self.command_poll_interval                = float(cfg["command_poll_interval_sec"])
+        self.device_ack_timeout                   = float(cfg["device_ack_timeout_sec"])
+        self.device_alive                         = False
+        self.ser: serial.Serial | None            = None
+        self.waiting_pending_queue: list[dict]    = [] # 백엔드에서 대기중인 CMD를 읽어온 후 아직 장치에게 전송하지 않은 CMD 목록
         self.processing_pending_queue: list[dict] = [] # 장치에게 전송한 후 아직 장치로부터 ACK/NACK을 받지 못한 CMD 목록
 
     def parse_data(self, data: str) -> dict:
@@ -259,9 +264,9 @@ class SVAgent:
                             if self.has_command(cmd["command_id"]):
                                 continue
                             self.waiting_pending_queue.append({
-                                "command_id": cmd["command_id"],
-                                "cmd_line": f"CMD,id={cmd['command_id']},led={0 if cmd['value'] == 'off' else 1}\n",
-                                "deadline": ""
+                                "command_id" : cmd["command_id"],
+                                "cmd_line"   : f"CMD,id={cmd['command_id']},led={0 if cmd['value'] == 'off' else 1}\n",
+                                "deadline"   : ""
                             })
                     pending_hb = now
                 # FIFO로 CMD를 전송했어도, 응답은 순서대로 오지 않을 수 있기에 모든 CMD에 대해 타임아웃 검사 및 처리

@@ -6,11 +6,11 @@ import logging
 import threading
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import psycopg
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Query
 from psycopg import errors as pg_errors
 from pydantic import BaseModel, Field
 
@@ -44,7 +44,8 @@ async def lifespan(_app: FastAPI):
         monitor.join(timeout=5)
         logger.info("heartbeat_monitor_stopped")
         db.close_pool()
-        
+
+
 app = FastAPI(title="SV Agent Backend", version="v1", lifespan=lifespan)
 
 
@@ -113,10 +114,31 @@ def _require_device(conn: psycopg.Connection, device_id: str) -> None:
 
 
 def _parse_ts(value: str, field: str) -> datetime:
+    """
+        텔레메트리가 하나도 안왔을 때 temperature, humidity는 None으로 처리.
+    """
     try:
         return datetime.fromisoformat(value)
     except ValueError:
         raise ValueError(f"invalid {field}: {value}") from None
+
+
+def _parse_compact_ts(value: str, field: str) -> datetime:
+    """콘솔이 보내는 YYYYMMDDHHMM을 UTC datetime으로 바꾼다."""
+    try:
+        return datetime.strptime(value, "%Y%m%d%H%M").replace(tzinfo=timezone.utc)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"invalid {field}: expected YYYYMMDDHHMM, got {value}",
+        ) from None
+
+
+def _as_float(value: Any) -> float | None:
+    """NUMERIC은 Decimal로 돌아온다. 그냥 담으면 JSON에 문자열로 나가므로 float로 바꾼다."""
+    if value is None:
+        return None
+    return float(value)
 
 
 class DeviceRegistration(BaseModel):
@@ -173,7 +195,7 @@ def device_heartbeat(
     with conn.cursor() as cur:
         cur.execute( # OFFLINE 상태였던 장치인지 확인
             """
-            SELECT status FROM devices 
+            SELECT status FROM devices
             WHERE id = %s
             """,
             (device_id,),
@@ -240,7 +262,7 @@ class TelemetryRequest(BaseModel):
             latest = sample
 
         return rows, latest
-    
+
     def insert_telemetry(
         self,
         conn: psycopg.Connection,
@@ -294,7 +316,7 @@ def check_threshold(conn: psycopg.Connection, device_id: str, latest: TelemetryS
     last_action = None
     command = None
     try:
-        # check_threshold함수의 실패가 insert_telemetry에 영향을 주지 않도록 
+        # check_threshold함수의 실패가 insert_telemetry에 영향을 주지 않도록
         # 중첩 transaction()이 SAVEPOINT를 만들어서, 여기서 실패해도 텔레메트리 INSERT는 커밋된다.
         with conn.transaction(), conn.cursor() as cur:
             cur.execute(
@@ -305,7 +327,7 @@ def check_threshold(conn: psycopg.Connection, device_id: str, latest: TelemetryS
             )
             row = cur.fetchone()
             if row is not None:
-            
+
                 if latest.temperature < row["threshold"] and row["last_action"] == "ON":
                     body = CommandCreate(type="SET_LED", value="off", source="rule")
                     command = body.insert_command(conn, device_id)
@@ -340,7 +362,7 @@ class CommandCreate(BaseModel):
     source: str = Field(default="console", max_length=10)
     cmd_id: str | None = Field(default=None, max_length=20)
 
-    def insert_command(self, conn: psycopg.Connection, device_id: str) -> None:
+    def insert_command(self, conn: psycopg.Connection, device_id: str) -> dict[str, Any]:
         cmd_id = uuid.uuid4().hex[:16]
         with conn.cursor() as cur:
             try:
@@ -376,6 +398,29 @@ def create_command(
     logger.info("command_created cmd_id=%s device=%s %s=%s", command["command_id"], device_id, command["type"], command["value"])
     return command
 
+@app.get("/api/v1/commands/{command_id}")
+def get_command(
+    command_id: str,
+    conn: psycopg.Connection = Depends(db.get_conn),
+) -> dict[str, Any]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT cmd_id, device_id, source, type, value, status, reason FROM commands WHERE cmd_id = %s""",
+            (command_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="command not found")
+        return {
+            "command_id": row["cmd_id"],
+            "device_id": row["device_id"],
+            "source": row["source"],
+            "type": row["type"],
+            "value": row["value"],
+            "status": row["status"],
+            "reason": row["reason"],
+        }
 
 # 에이전트 send_api 별명: pending
 @app.get("/api/v1/devices/{device_id}/commands/pending")
@@ -432,22 +477,21 @@ def update_command(
             UPDATE commands
             SET status = %s, reason = %s
             WHERE cmd_id = %s
-            RETURNING status, reason
             """,
             (body.status, body.reason, command_id),
         )
-        row = cur.fetchone()
 
-    if row is None:
-        raise HTTPException(status_code=404, detail="command not found")
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="command not found")
 
-    logger.info("command_updated cmd_id=%s status=%s reason=%s", command_id, row["status"], row["reason"])
-    return {"status": row["status"], "reason": row["reason"]}
+    logger.info("command_updated cmd_id=%s status=%s reason=%s", command_id, body.status, body.reason)
+    return {"status": body.status, "reason": body.reason}
 
 class ThresholdRule(BaseModel):
     threshold: float = Field(ge=0.0, le=100.0) # 0.0 ~ 100.0
 
-@app.put("/api/v1/devices/{device_id}/rules")
+# 콘솔 svctl rule --threshold.
+@app.put("/api/v1/devices/{device_id}/rule")
 def update_threshold_rule(
     device_id: str,
     body: ThresholdRule,
@@ -459,22 +503,217 @@ def update_threshold_rule(
     with conn.cursor() as cur:
         cur.execute(
             """
-                INSERT INTO rules (device_id, threshold)
-                VALUES (%s, %s)
-                ON CONFLICT (device_id) DO UPDATE SET threshold = EXCLUDED.threshold
-                RETURNING threshold
-                """,
-                (device_id, body.threshold),
-            )
+            INSERT INTO rules (device_id, threshold)
+            VALUES (%s, %s)
+            ON CONFLICT (device_id) DO UPDATE SET threshold = EXCLUDED.threshold
+            RETURNING threshold
+            """,
+            (device_id, body.threshold),
+        )
         # ON CONFLICT DO UPDATE ... RETURNING은 삽입이든 갱신이든 항상 행을 반환해야한다.
         row = cur.fetchone()
 
-    # NUMERIC은 Decimal로 돌아오므로 float로 변환한다. 그냥 담으면 JSON에 문자열로 나간다.
-    threshold = float(row["threshold"])
+    threshold = _as_float(row["threshold"])
     logger.info("rule_updated device=%s threshold=%s", device_id, threshold)
     return {"threshold": threshold}
 
 
+# 콘솔 svctl rule (조회)
+@app.get("/api/v1/devices/{device_id}/rule")
+def get_threshold_rule(
+    device_id: str,
+    conn: psycopg.Connection = Depends(db.get_conn),
+) -> dict[str, Any]:
+    _require_device(conn, device_id)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT threshold, last_action FROM rules WHERE device_id = %s
+            """,
+            (device_id,),
+        )
+        row = cur.fetchone()
+
+    if row is None:
+        raise HTTPException(status_code=404, detail="rule not found")
+
+    return {
+        "threshold": _as_float(row["threshold"]),
+        "last_action": row["last_action"],
+    }
+
+
+# 콘솔 svctl devices
+@app.get("/api/v1/devices")
+def get_devices_list(
+    conn: psycopg.Connection = Depends(db.get_conn),
+) -> list[dict[str, Any]]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, status, latest_temperature, latest_humidity, last_heartbeat_time
+            FROM devices
+            ORDER BY id
+            """
+        )
+        rows = cur.fetchall()
+
+    return [
+        {
+            "id": row["id"],
+            "status": row["status"],
+            "latest_temperature": _as_float(row["latest_temperature"]),
+            "latest_humidity": _as_float(row["latest_humidity"]),
+            "last_heartbeat_time": row["last_heartbeat_time"],
+        }
+        for row in rows
+    ]
+
+
+RECENT_COMMAND_COUNT = 3
+
+# 콘솔 svctl status
+@app.get("/api/v1/devices/{device_id}")
+def get_device_info(
+    device_id: str,
+    conn: psycopg.Connection = Depends(db.get_conn),
+) -> dict[str, Any]:
+    """장치 한 건과 규칙, 그리고 최근 명령 몇 건을 함께 돌려준다."""
+    with conn.cursor() as cur:
+        # 규칙이 없는 장치도 조회되어야 하므로 LEFT JOIN 이다.
+        # 컬럼명이 겹치면 dict_row 가 하나로 합쳐버리므로 status 는 별칭을 준다.
+        cur.execute(
+            """
+            SELECT
+                d.id,
+                d.status AS device_status,
+                d.latest_temperature,
+                d.latest_humidity,
+                d.last_heartbeat_time,
+                r.threshold,
+                r.last_action
+            FROM devices d
+                LEFT JOIN rules r ON d.id = r.device_id
+            WHERE d.id = %s
+            """,
+            (device_id,),
+        )
+        device = cur.fetchone()
+        if device is None:
+            raise HTTPException(status_code=404, detail="device not found")
+
+        # 명령은 행 수가 다르므로 같은 SQL 에 조인하지 않고 따로 뽑는다.
+        # 한 SQL 에 넣으면 텔레메트리/명령의 곱집합이 되어 LIMIT 이 의미를 잃는다.
+        cur.execute(
+            """
+            SELECT cmd_id, source, type, value, status, reason, created_at
+            FROM commands
+            WHERE device_id = %s
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
+            (device_id, RECENT_COMMAND_COUNT),
+        )
+        command_rows = cur.fetchall()
+
+    return {
+        "id": device["id"],
+        "status": device["device_status"],
+        "latest_temperature": _as_float(device["latest_temperature"]),
+        "latest_humidity": _as_float(device["latest_humidity"]),
+        "last_heartbeat_time": device["last_heartbeat_time"],
+        "threshold": _as_float(device["threshold"]),
+        "last_action": device["last_action"],
+        "recent_commands": [
+            {
+                "command_id": row["cmd_id"],
+                "source": row["source"],
+                "type": row["type"],
+                "value": row["value"],
+                "status": row["status"],
+                "reason": row["reason"],
+                "created_at": row["created_at"],
+            }
+            for row in command_rows
+        ],
+    }
+
+# 콘솔 svctl commands. pending 경로보다 덜 구체적이므로 그 아래에 둔다.
+@app.get("/api/v1/devices/{device_id}/commands")
+def list_commands(
+    device_id: str,
+    limit: int = Query(default=20, ge=1, le=200),
+    conn: psycopg.Connection = Depends(db.get_conn),
+) -> list[dict[str, Any]]:
+    _require_device(conn, device_id)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT cmd_id, source, type, value, status, reason, created_at
+            FROM commands
+            WHERE device_id = %s
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
+            (device_id, limit),
+        )
+        rows = cur.fetchall()
+
+    return [
+        {
+            "command_id": row["cmd_id"],
+            "source": row["source"],
+            "type": row["type"],
+            "value": row["value"],
+            "status": row["status"],
+            "reason": row["reason"],
+            "created_at": row["created_at"],
+        }
+        for row in rows
+    ]
+
+
+# 콘솔 svctl history
+@app.get("/api/v1/devices/{device_id}/telemetry")
+def get_telemetry(
+    device_id: str,
+    from_time: str = Query(..., alias="from"),
+    to_time: str = Query(..., alias="to"),
+    limit: int = Query(default=50, ge=1, le=500),
+    conn: psycopg.Connection = Depends(db.get_conn),
+) -> list[dict[str, Any]]:
+    _require_device(conn, device_id)
+
+    start = _parse_compact_ts(from_time, "from")
+    end = _parse_compact_ts(to_time, "to")
+    if start > end:
+        # BETWEEN 은 양 끝을 포함하므로 두 값이 같은 경우는 허용한다.
+        raise HTTPException(status_code=400, detail="from must not be later than to")
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT seq, temperature, humidity, ts
+            FROM telemetry
+            WHERE device_id = %s AND ts BETWEEN %s AND %s
+            ORDER BY ts DESC
+            LIMIT %s
+            """,
+            (device_id, start, end, limit),
+        )
+        rows = cur.fetchall()
+
+    return [
+        {
+            "seq": row["seq"],
+            "temperature": _as_float(row["temperature"]),
+            "humidity": _as_float(row["humidity"]),
+            "ts": row["ts"],
+        }
+        for row in rows
+    ]
 
 if __name__ == "__main__":
     import uvicorn
