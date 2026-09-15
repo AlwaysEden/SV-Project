@@ -1,6 +1,7 @@
 from backend.app import TelemetryRequest
 from datetime import datetime
 import pytest
+from fastapi import HTTPException
 from pydantic import ValidationError
 
 def test_prepare_telemetry_rows_two_samples() -> None:

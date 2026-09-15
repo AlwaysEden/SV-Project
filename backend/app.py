@@ -26,7 +26,29 @@ logging.basicConfig(
 COMMAND_STATUSES = ("PENDING", "ACK", "NACK", "FAILED")
 MONITOR_INTERVAL_SEC = 1.0
 
+OPENAPI_TAGS = [
+    {"name": "health", "description": "프로세스 생존 확인"},
+    {"name": "devices", "description": "장치 등록, 목록, 상세"},
+    {"name": "heartbeat", "description": "장치 생존 하트비트"},
+    {"name": "telemetry", "description": "센서 샘플 업로드와 조회"},
+    {"name": "commands", "description": "명령 생성, 폴링, 상태 갱신"},
+    {"name": "rules", "description": "온도 임계치 규칙"},
+]
+
 _stop_monitor = threading.Event()
+
+
+class ErrorMessage(BaseModel):
+    detail: str
+
+
+NOT_FOUND = {404: {"model": ErrorMessage, "description": "대상을 찾지 못함"}}
+BAD_REQUEST = {400: {"model": ErrorMessage, "description": "요청 값이 올바르지 않음"}}
+BAD_REQUEST_OR_NOT_FOUND = {
+    400: {"model": ErrorMessage, "description": "요청 값이 올바르지 않음"},
+    404: {"model": ErrorMessage, "description": "대상을 찾지 못함"},
+}
+
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -46,11 +68,21 @@ async def lifespan(_app: FastAPI):
         db.close_pool()
 
 
-app = FastAPI(title="SV Agent Backend", version="v1", lifespan=lifespan)
+app = FastAPI(
+    title="SV Agent Backend",
+    version="v1",
+    description="에이전트와 콘솔이 호출하는 REST API. Swagger UI는 /docs, ReDoc은 /redoc, 스키마는 /openapi.json.",
+    openapi_tags=OPENAPI_TAGS,
+    lifespan=lifespan,
+)
 
 
-@app.get("/health")
-def health() -> dict[str, str]:
+class HealthOut(BaseModel):
+    status: str
+
+
+@app.get("/health", tags=["health"], summary="프로세스 생존 확인")
+def health() -> HealthOut:
     return {"status": "ok"}
 
 
@@ -113,9 +145,9 @@ def _require_device(conn: psycopg.Connection, device_id: str) -> None:
             raise HTTPException(status_code=404, detail="device not registered")
 
 
-def _parse_ts(value: str, field: str) -> datetime:
+def utc_to_datetime(value: str, field: str) -> datetime:
     """
-        텔레메트리가 하나도 안왔을 때 temperature, humidity는 None으로 처리.
+        UTC를 비교/저장이 가능한 datetime으로 변환.
     """
     try:
         return datetime.fromisoformat(value)
@@ -123,8 +155,10 @@ def _parse_ts(value: str, field: str) -> datetime:
         raise ValueError(f"invalid {field}: {value}") from None
 
 
-def _parse_compact_ts(value: str, field: str) -> datetime:
-    """콘솔이 보내는 YYYYMMDDHHMM을 UTC datetime으로 바꾼다."""
+def yyyymmddhhmm_to_utc(value: str, field: str) -> datetime: 
+    """
+        YYYYMMDDHHMM을 UTC datetime으로 변환.
+    """
     try:
         return datetime.strptime(value, "%Y%m%d%H%M").replace(tzinfo=timezone.utc)
     except ValueError:
@@ -135,22 +169,32 @@ def _parse_compact_ts(value: str, field: str) -> datetime:
 
 
 def _as_float(value: Any) -> float | None:
-    """NUMERIC은 Decimal로 돌아온다. 그냥 담으면 JSON에 문자열로 나가므로 float로 바꾼다."""
+    """temperature, humidity, threashold는 float으로 변환해줘야하는데, 값이 없는 경우도 있기 때문에 이를 처리하기 위함."""
     if value is None:
         return None
     return float(value)
 
 
 class DeviceRegistration(BaseModel):
-    device_id: str = Field(max_length=10)
-    device_url: str = Field(max_length=50)
+    device_id: str = Field(max_length=10, description="장치 ID")
+    device_url: str = Field(max_length=50, description="에이전트가 장치에 붙는 주소")
+
+
+class DeviceOut(BaseModel):
+    device_id: str
+    device_url: str
 
 # 에이전트 send_api 별명: device_registration
-@app.post("/api/v1/devices", status_code=201)
+@app.post(
+    "/api/v1/devices",
+    status_code=201,
+    tags=["devices"],
+    summary="장치 등록",
+)
 def register_device(
     body: DeviceRegistration,
     conn: psycopg.Connection = Depends(db.get_conn),
-) -> dict[str, Any]:
+) -> DeviceOut:
     with conn.cursor() as cur:
         cur.execute("SELECT 1 FROM devices WHERE id = %s", (body.device_id,))
         existing = cur.fetchone() is not None
@@ -175,20 +219,31 @@ def register_device(
 
 
 class HeartbeatRequest(BaseModel):
+    device_alive: bool = Field(description="장치가 살아있는지 여부")
+    timestamp: str = Field(description="에이전트 UTC 시각")
+
+
+class HeartbeatOut(BaseModel):
+    status: str
     device_alive: bool
     timestamp: str
 
 # 에이전트 send_api 별명: device_heartbeat
-@app.post("/api/v1/devices/{device_id}/heartbeat")
+@app.post(
+    "/api/v1/devices/{device_id}/heartbeat",
+    tags=["heartbeat"],
+    summary="하트비트 보고",
+    responses=BAD_REQUEST_OR_NOT_FOUND,
+)
 def device_heartbeat(
     device_id: str,
     body: HeartbeatRequest,
     conn: psycopg.Connection = Depends(db.get_conn),
-) -> dict[str, Any]:
+) -> HeartbeatOut:
     # device_alive는 저장하지 않는다. 에이전트는 장치가 살아있을 때만 하트비트를 보내므로
     # last_heartbeat_time 만으로 Offline 판정이 가능하다.
     try:
-        heartbeat_at = _parse_ts(body.timestamp, "timestamp")
+        heartbeat_at = utc_to_datetime(body.timestamp, "timestamp")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from None
 
@@ -234,15 +289,14 @@ def device_heartbeat(
 
 
 class TelemetrySample(BaseModel):
-    """샘플 하나. 필드 누락과 타입 오류는 Pydantic이 422로 거절한다."""
-    seq: int
-    ts: datetime
-    temperature: float
-    humidity: float
+    seq: int = Field(description="장치 샘플 일련번호")
+    ts: datetime = Field(description="샘플 시각")
+    temperature: float = Field(description="온도")
+    humidity: float = Field(description="습도")
 
 
 class TelemetryRequest(BaseModel):
-    samples: list[TelemetrySample] = Field(min_length=1)
+    samples: list[TelemetrySample] = Field(min_length=1, description="업로드할 샘플. 1건 이상")
 
     def prepare_telemetry_rows(
         self,
@@ -290,13 +344,23 @@ class TelemetryRequest(BaseModel):
                 )
         return len(rows)
 
+
+class TelemetryAcceptOut(BaseModel):
+    accepted: int
+
+
 # 에이전트 send_api 별명: data_upload
-@app.post("/api/v1/devices/{device_id}/telemetry")
+@app.post(
+    "/api/v1/devices/{device_id}/telemetry",
+    tags=["telemetry"],
+    summary="텔레메트리 업로드",
+    responses=NOT_FOUND,
+)
 def save_telemetry(
     device_id: str,
     body: TelemetryRequest,
     conn: psycopg.Connection = Depends(db.get_conn),
-) -> dict[str, Any]:
+) -> TelemetryAcceptOut:
     _require_device(conn, device_id)
     rows, latest = body.prepare_telemetry_rows()
     accepted = body.insert_telemetry(conn, device_id, rows, latest)
@@ -357,10 +421,14 @@ def check_threshold(conn: psycopg.Connection, device_id: str, latest: TelemetryS
         logger.exception("rule_evaluation_failed device=%s", device_id)
 
 class CommandCreate(BaseModel):
-    type: str = Field(max_length=20)
-    value: str = Field(max_length=10)
-    source: str = Field(default="console", max_length=10)
-    cmd_id: str | None = Field(default=None, max_length=20)
+    type: str = Field(max_length=20, description="명령 종류. 예: SET_LED")
+    value: str = Field(max_length=10, description="명령 값. 예: on, off")
+    source: str = Field(default="console", max_length=10, description="명령 출처. console 또는 rule")
+    cmd_id: str | None = Field(
+        default=None,
+        max_length=20,
+        description="클라이언트가 넣는 ID. 서버는 무시하고 새로 발급한다",
+    )
 
     def insert_command(self, conn: psycopg.Connection, device_id: str) -> dict[str, Any]:
         cmd_id = uuid.uuid4().hex[:16]
@@ -385,12 +453,28 @@ class CommandCreate(BaseModel):
             "status": "PENDING",
         }
 
-@app.post("/api/v1/devices/{device_id}/commands", status_code=201)
+
+class CommandOut(BaseModel):
+    command_id: str
+    device_id: str
+    source: str
+    type: str
+    value: str
+    status: str
+
+
+@app.post(
+    "/api/v1/devices/{device_id}/commands",
+    status_code=201,
+    tags=["commands"],
+    summary="명령 생성",
+    responses=NOT_FOUND,
+)
 def create_command(
     device_id: str,
     body: CommandCreate,
     conn: psycopg.Connection = Depends(db.get_conn)
-) -> dict[str, Any]:
+) -> CommandOut:
     """콘솔이 명령을 생성한다. 에이전트는 pending 폴링으로 이 명령을 읽어간다."""
     _require_device(conn, device_id)
 
@@ -398,11 +482,27 @@ def create_command(
     logger.info("command_created cmd_id=%s device=%s %s=%s", command["command_id"], device_id, command["type"], command["value"])
     return command
 
-@app.get("/api/v1/commands/{command_id}")
+
+class CommandDetailOut(BaseModel):
+    command_id: str
+    device_id: str
+    source: str
+    type: str
+    value: str
+    status: str
+    reason: str | None = None
+
+
+@app.get(
+    "/api/v1/commands/{command_id}",
+    tags=["commands"],
+    summary="명령 단건 조회",
+    responses=NOT_FOUND,
+)
 def get_command(
     command_id: str,
     conn: psycopg.Connection = Depends(db.get_conn),
-) -> dict[str, Any]:
+) -> CommandDetailOut:
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -422,12 +522,24 @@ def get_command(
             "reason": row["reason"],
         }
 
+
+class PendingCommandOut(BaseModel):
+    command_id: str
+    type: str
+    value: str
+
+
 # 에이전트 send_api 별명: pending
-@app.get("/api/v1/devices/{device_id}/commands/pending")
+@app.get(
+    "/api/v1/devices/{device_id}/commands/pending",
+    tags=["commands"],
+    summary="대기 명령 폴링",
+    responses=NOT_FOUND,
+)
 def get_pending_commands(
     device_id: str,
     conn: psycopg.Connection = Depends(db.get_conn),
-) -> list[dict[str, Any]]:
+) -> list[PendingCommandOut]:
     """대기중인 명령 전건. 에이전트가 이미 받은 command_id는 무시한다."""
     _require_device(conn, device_id)
 
@@ -455,16 +567,26 @@ def get_pending_commands(
 
 
 class CommandUpdate(BaseModel):
+    status: str = Field(description="ACK, NACK, FAILED, PENDING 중 하나")
+    reason: str | None = Field(default=None, max_length=500, description="FAILED일 때 사유")
+
+
+class CommandStatusOut(BaseModel):
     status: str
-    reason: str | None = Field(default=None, max_length=500)
+    reason: str | None = None
 
 # 에이전트 send_api 별명: cmd_send (ACK / NACK / FAILED)
-@app.patch("/api/v1/commands/{command_id}")
+@app.patch(
+    "/api/v1/commands/{command_id}",
+    tags=["commands"],
+    summary="명령 상태 갱신",
+    responses=BAD_REQUEST_OR_NOT_FOUND,
+)
 def update_command(
     command_id: str,
     body: CommandUpdate,
     conn: psycopg.Connection = Depends(db.get_conn),
-) -> dict[str, Any]:
+) -> CommandStatusOut:
     if body.status not in COMMAND_STATUSES:
         raise HTTPException(
             status_code=400,
@@ -488,15 +610,24 @@ def update_command(
     return {"status": body.status, "reason": body.reason}
 
 class ThresholdRule(BaseModel):
-    threshold: float = Field(ge=0.0, le=100.0) # 0.0 ~ 100.0
+    threshold: float = Field(ge=0.0, le=100.0, description="온도 임계치 (0.0 ~ 100.0)")
+
+
+class ThresholdOut(BaseModel):
+    threshold: float | None = None
 
 # 콘솔 svctl rule --threshold.
-@app.put("/api/v1/devices/{device_id}/rule")
+@app.put(
+    "/api/v1/devices/{device_id}/rule",
+    tags=["rules"],
+    summary="임계치 규칙 설정",
+    responses=NOT_FOUND,
+)
 def update_threshold_rule(
     device_id: str,
     body: ThresholdRule,
     conn: psycopg.Connection = Depends(db.get_conn),
-) -> dict[str, Any]:
+) -> ThresholdOut:
 
     _require_device(conn, device_id)
 
@@ -518,12 +649,22 @@ def update_threshold_rule(
     return {"threshold": threshold}
 
 
+class RuleOut(BaseModel):
+    threshold: float | None = None
+    last_action: str
+
+
 # 콘솔 svctl rule (조회)
-@app.get("/api/v1/devices/{device_id}/rule")
+@app.get(
+    "/api/v1/devices/{device_id}/rule",
+    tags=["rules"],
+    summary="임계치 규칙 조회",
+    responses=NOT_FOUND,
+)
 def get_threshold_rule(
     device_id: str,
     conn: psycopg.Connection = Depends(db.get_conn),
-) -> dict[str, Any]:
+) -> RuleOut:
     _require_device(conn, device_id)
 
     with conn.cursor() as cur:
@@ -544,11 +685,19 @@ def get_threshold_rule(
     }
 
 
+class DeviceListItem(BaseModel):
+    id: str
+    status: str
+    latest_temperature: float | None = None
+    latest_humidity: float | None = None
+    last_heartbeat_time: datetime | None = None
+
+
 # 콘솔 svctl devices
-@app.get("/api/v1/devices")
+@app.get("/api/v1/devices", tags=["devices"], summary="장치 목록")
 def get_devices_list(
     conn: psycopg.Connection = Depends(db.get_conn),
-) -> list[dict[str, Any]]:
+) -> list[DeviceListItem]:
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -573,12 +722,39 @@ def get_devices_list(
 
 RECENT_COMMAND_COUNT = 3
 
+
+class CommandListItem(BaseModel):
+    command_id: str
+    source: str
+    type: str
+    value: str
+    status: str
+    reason: str | None = None
+    created_at: datetime
+
+
+class DeviceDetailOut(BaseModel):
+    id: str
+    status: str
+    latest_temperature: float | None = None
+    latest_humidity: float | None = None
+    last_heartbeat_time: datetime | None = None
+    threshold: float | None = None
+    last_action: str | None = None
+    recent_commands: list[CommandListItem]
+
+
 # 콘솔 svctl status
-@app.get("/api/v1/devices/{device_id}")
+@app.get(
+    "/api/v1/devices/{device_id}",
+    tags=["devices"],
+    summary="장치 상세",
+    responses=NOT_FOUND,
+)
 def get_device_info(
     device_id: str,
     conn: psycopg.Connection = Depends(db.get_conn),
-) -> dict[str, Any]:
+) -> DeviceDetailOut:
     """장치 한 건과 규칙, 그리고 최근 명령 몇 건을 함께 돌려준다."""
     with conn.cursor() as cur:
         # 규칙이 없는 장치도 조회되어야 하므로 LEFT JOIN 이다.
@@ -640,12 +816,17 @@ def get_device_info(
     }
 
 # 콘솔 svctl commands. pending 경로보다 덜 구체적이므로 그 아래에 둔다.
-@app.get("/api/v1/devices/{device_id}/commands")
+@app.get(
+    "/api/v1/devices/{device_id}/commands",
+    tags=["commands"],
+    summary="명령 목록",
+    responses=NOT_FOUND,
+)
 def list_commands(
     device_id: str,
-    limit: int = Query(default=20, ge=1, le=200),
+    limit: int = Query(default=20, ge=1, le=200, description="최대 건수"),
     conn: psycopg.Connection = Depends(db.get_conn),
-) -> list[dict[str, Any]]:
+) -> list[CommandListItem]:
     _require_device(conn, device_id)
 
     with conn.cursor() as cur:
@@ -675,19 +856,31 @@ def list_commands(
     ]
 
 
+class TelemetryPointOut(BaseModel):
+    seq: int
+    temperature: float | None = None
+    humidity: float | None = None
+    ts: datetime
+
+
 # 콘솔 svctl history
-@app.get("/api/v1/devices/{device_id}/telemetry")
+@app.get(
+    "/api/v1/devices/{device_id}/telemetry",
+    tags=["telemetry"],
+    summary="텔레메트리 조회",
+    responses=BAD_REQUEST_OR_NOT_FOUND,
+)
 def get_telemetry(
     device_id: str,
-    from_time: str = Query(..., alias="from"),
-    to_time: str = Query(..., alias="to"),
-    limit: int = Query(default=50, ge=1, le=500),
+    from_time: str = Query(..., alias="from", description="조회 시작 (YYYYMMDDHHMM, UTC)"),
+    to_time: str = Query(..., alias="to", description="조회 끝 (YYYYMMDDHHMM, UTC)"),
+    limit: int = Query(default=50, ge=1, le=500, description="최대 건수"),
     conn: psycopg.Connection = Depends(db.get_conn),
-) -> list[dict[str, Any]]:
+) -> list[TelemetryPointOut]:
     _require_device(conn, device_id)
 
-    start = _parse_compact_ts(from_time, "from")
-    end = _parse_compact_ts(to_time, "to")
+    start = yyyymmddhhmm_to_utc(from_time, "from")
+    end = yyyymmddhhmm_to_utc(to_time, "to")
     if start > end:
         # BETWEEN 은 양 끝을 포함하므로 두 값이 같은 경우는 허용한다.
         raise HTTPException(status_code=400, detail="from must not be later than to")
