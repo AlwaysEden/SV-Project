@@ -203,9 +203,16 @@ class SVAgent:
     def flush_cmd_queue(self) -> None:
 
         for cmd in list(self.waiting_pending_queue): # 순회 중 원본에서 제거하므로 복사본을 돈다
+            try:
+                self.ser.write(cmd["cmd_line"].encode("utf-8"))
+                logger.info("cmd_sent_to_device cmd_id=%s line=%s", cmd["command_id"], cmd["cmd_line"].strip())
+            except (OSError, AttributeError) as e:
+                logger.warning("cmd_send_failed cmd_id=%s line=%s reason=%r", cmd["command_id"], cmd["cmd_line"].strip(), e)
+                self.waiting_pending_queue.remove(cmd)
+                self.send_api("cmd_send", None, "FAILED", cmd["command_id"])
+                continue
+
             cmd["deadline"] = time.monotonic() + self.device_ack_timeout
-            self.ser.write(cmd["cmd_line"].encode("utf-8"))
-            logger.info("cmd_sent_to_device cmd_id=%s line=%s", cmd["command_id"], cmd["cmd_line"].strip())
             self.processing_pending_queue.append(cmd)
             self.waiting_pending_queue.remove(cmd)
 
@@ -218,15 +225,16 @@ class SVAgent:
                 if self.ser is None:
                     self.connect_device()
                     if self.ser is None: # 다시 시도했을 때도 연결 실패. 다음 주기에 재시도.
+                        if self.waiting_pending_queue: # 대기중인 CMD가 있으면 장치에 전송
+                            self.flush_cmd_queue()
                         time.sleep(1)
                         continue
 
                 data = self.ser.readline().decode("utf-8", "replace").strip()
-                if not data:
-                    continue
-                logger.debug("device_line %s", data)
+                if data:
+                    logger.debug("device_line %s", data)
+                    self.handle_data(data)
 
-                self.handle_data(data)
                 if self.waiting_pending_queue: # 대기중인 CMD가 있으면 장치에 전송
                     self.flush_cmd_queue()
 
@@ -238,6 +246,7 @@ class SVAgent:
                 logger.exception("device_loop_error")
                 self.close_device() # 핸들이 깨졌을 수 있으므로 재연결시킨다. 영구 실패 루프보다 낫다.
                 time.sleep(1)
+
 
     def api_loop(self) -> None:
         '''
