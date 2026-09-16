@@ -123,6 +123,9 @@ def get_device_history(device_id, from_time, to_time, limit):
     )
     return read_json(response)
 
+def get_events():
+    response = requests.get(f"{BACKEND_URL}/api/v1/events", timeout=TIMEOUT_SEC)
+    return read_json(response)
 
 def parse_yyyymmddhhmm(value: str) -> datetime:
     try:
@@ -168,6 +171,9 @@ def main() -> None:
     sp_commands.add_argument("device_id", help="장치 ID")
     sp_commands.add_argument("--limit", type=int, default=20, help="최대 개수 (기본: 20)")
 
+    # "svctl events": 전환 이벤트 목록 출력
+    sp_events = subparsers.add_parser("events", help="전환 이벤트 목록을 출력")
+
     args = ap.parse_args()
 
     try:
@@ -201,6 +207,8 @@ def run(ap, args) -> None:
         from_time = args.from_time.strftime("%Y%m%d%H%M")
         to_time = args.to_time.strftime("%Y%m%d%H%M")
         print_table(get_device_history(args.device_id, from_time, to_time, args.limit))
+    elif args.svctl == "events":
+        print_table(get_events())
     else:
         ap.print_help()
 

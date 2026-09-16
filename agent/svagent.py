@@ -242,10 +242,13 @@ class SVAgent:
                 logger.warning("device_connection_lost")
                 self.close_device()
                 time.sleep(1)
+                logger.warning("device_connection_retrying")
+
             except Exception: # 루프가 죽으면 장치와의 통신이 멈추므로 스택까지 남기고 계속 돈다.
                 logger.exception("device_loop_error")
                 self.close_device() # 핸들이 깨졌을 수 있으므로 재연결시킨다. 영구 실패 루프보다 낫다.
                 time.sleep(1)
+                logger.warning("device_connection_retrying")
 
 
     def api_loop(self) -> None:

@@ -720,9 +720,6 @@ def get_devices_list(
     ]
 
 
-RECENT_COMMAND_COUNT = 3
-
-
 class CommandListItem(BaseModel):
     command_id: str
     source: str
@@ -743,6 +740,7 @@ class DeviceDetailOut(BaseModel):
     last_action: str | None = None
     recent_commands: list[CommandListItem]
 
+RECENT_COMMAND_COUNT = 3
 
 # 콘솔 svctl status
 @app.get(
@@ -904,6 +902,36 @@ def get_telemetry(
             "temperature": _as_float(row["temperature"]),
             "humidity": _as_float(row["humidity"]),
             "ts": row["ts"],
+        }
+        for row in rows
+    ]
+
+
+class EventOut(BaseModel):
+    seq: int
+    device_id: str
+    type: str
+    updated_at: datetime
+
+@app.get("/api/v1/events", tags=["events"], summary="전환 이벤트 목록 조회")
+def get_events(
+    conn: psycopg.Connection = Depends(db.get_conn),
+) -> list[EventOut]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT seq, device_id, type, updated_at FROM event_logs
+            """
+        )
+        rows = cur.fetchall()
+
+    return [
+        {
+            "seq": row["seq"],
+            "device_id": row["device_id"],
+            "type": row["type"],
+            "updated_at": row["updated_at"].astimezone(timezone.utc),
+       
         }
         for row in rows
     ]
