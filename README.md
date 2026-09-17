@@ -1,7 +1,7 @@
 # 현장 장비 모니터링·제어 시스템
 
 - 데모 영상: `[https://youtu.be/OGv51viSNH8?si=vtsRFqV2waQA8UYA]`
-- 제출 커밋: `[커밋 해시를 입력하세요]`
+- 제출 커밋: `[da2df708bd066cf41d0702423a1ccc8250bd36f0]`
 
 ## 1. 프로젝트 개요
 
