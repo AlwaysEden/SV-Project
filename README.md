@@ -1,11 +1,12 @@
 # 현장 장비 모니터링·제어 시스템
 
-- 데모 영상: `[링크를 입력하세요]`
+- 데모 영상: `[https://youtu.be/OGv51viSNH8?si=vtsRFqV2waQA8UYA]`
 - 제출 커밋: `[커밋 해시를 입력하세요]`
 
 ## 1. 프로젝트 개요
 
 온·습도 센서와 LED가 있는 현장 장치를 대상으로 다음 기능을 제공하는 미니 시스템입니다.
+
 - **장치**: 온·습도 센서 데이터를 주기적으로 보고하며, 전달받은 명령을 수행하고 응답
 - **장치 에이전트**: 장치 프로토콜을 읽고 텔레메트리를 백엔드에 업로드하며, 백엔드 명령을 장치에 전달
 - **백엔드**: FastAPI REST API와 PostgreSQL을 이용한 장치·측정값·명령·규칙 관리
@@ -36,13 +37,20 @@
 └── requirements.txt
 ```
 
+
+
 ## 3. 사전 요구 사항
 
 - Docker 및 Docker Compose
 - Python 3.8 이상
 - 로컬 포트 `5432`, `5555`, `5556`, `8000` 사용 가능
 
+
+
 ## 4. 설치 및 실행
+
+
+
 ### 4.1 환경 설정
 
 ```bash
@@ -51,6 +59,9 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
+
+
+
 ### 4.2 실행 순서
 
 터미널을 4개 사용합니다.
@@ -60,12 +71,6 @@ pip install -r requirements.txt
 ```bash
 docker compose up -d --build
 curl http://127.0.0.1:8000/health
-```
-
-정상 응답:
-
-```json
-{"status":"ok"}
 ```
 
 백엔드를 중지하려면 다음을 실행합니다.
@@ -79,6 +84,8 @@ docker compose down
 ```bash
 docker compose down -v
 ```
+
+
 
 #### 터미널 2: 장치 시뮬레이터
 
@@ -115,6 +122,8 @@ export SVCTL_URL=http://127.0.0.1:8000
 python console/svctl.py devices
 ```
 
+
+
 ## 5. 운영자 콘솔 사용법
 
 ```bash
@@ -146,26 +155,30 @@ python console/svctl.py commands dev-001 --limit 20
 
 백엔드가 실행된 뒤 다음 문서를 확인할 수 있습니다.
 
-- Swagger UI: http://127.0.0.1:8000/docs
-- ReDoc: http://127.0.0.1:8000/redoc
-- OpenAPI JSON: http://127.0.0.1:8000/openapi.json
+- Swagger UI: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
+- ReDoc: [http://127.0.0.1:8000/redoc](http://127.0.0.1:8000/redoc)
+- OpenAPI JSON: [http://127.0.0.1:8000/openapi.json](http://127.0.0.1:8000/openapi.json)
 
 주요 엔드포인트는 다음과 같습니다.
 
-| Method | Endpoint | 설명 |
-| --- | --- | --- |
-| `POST` | `/api/v1/devices` | 장치 등록 또는 재등록 |
-| `GET` | `/api/v1/devices` | 장치 목록과 상태 |
-| `GET` | `/api/v1/devices/{id}` | 장치 상세, 규칙, 최근 명령 |
-| `POST` | `/api/v1/devices/{id}/heartbeat` | 하트비트 보고 |
-| `POST` | `/api/v1/devices/{id}/telemetry` | 온·습도 측정값 적재 |
-| `GET` | `/api/v1/devices/{id}/telemetry` | 측정 이력 조회 |
-| `POST` | `/api/v1/devices/{id}/commands` | LED 명령 생성 |
-| `GET` | `/api/v1/devices/{id}/commands/pending` | 에이전트용 대기 명령 조회 |
-| `GET` | `/api/v1/devices/{id}/commands` | 명령 이력 조회 |
-| `GET` | `/api/v1/commands/{command_id}` | 명령 단건 조회 |
-| `PATCH` | `/api/v1/commands/{command_id}` | `ACK`/`NACK`/`FAILED` 결과 보고 |
-| `GET`, `PUT` | `/api/v1/devices/{id}/rule` | 임계치 규칙 조회·설정 |
+
+| Method       | Endpoint                                | 설명                          |
+| ------------ | --------------------------------------- | --------------------------- |
+| `POST`       | `/api/v1/devices`                       | 장치 등록 또는 재등록                |
+| `GET`        | `/api/v1/devices`                       | 장치 목록과 상태                   |
+| `GET`        | `/api/v1/devices/{id}`                  | 장치 상세, 규칙, 최근 명령            |
+| `POST`       | `/api/v1/devices/{id}/heartbeat`        | 하트비트 보고                     |
+| `POST`       | `/api/v1/devices/{id}/telemetry`        | 온·습도 측정값 적재                 |
+| `GET`        | `/api/v1/devices/{id}/telemetry`        | 측정 이력 조회                    |
+| `POST`       | `/api/v1/devices/{id}/commands`         | LED 명령 생성                   |
+| `GET`        | `/api/v1/devices/{id}/commands/pending` | 에이전트용 대기 명령 조회              |
+| `GET`        | `/api/v1/devices/{id}/commands`         | 명령 이력 조회                    |
+| `GET`        | `/api/v1/commands/{command_id}`         | 명령 단건 조회                    |
+| `PATCH`      | `/api/v1/commands/{command_id}`         | `ACK`/`NACK`/`FAILED` 결과 보고 |
+| `GET`, `PUT` | `/api/v1/devices/{id}/rule`             | 임계치 규칙 조회·설정                |
+
+
+
 
 ### 명령 상태
 
@@ -179,6 +192,8 @@ PENDING ──> ACK
 
 ## 7. 검증 시나리오
 
+
+
 ### 시나리오 1: 정상 수집
 
 1. 5장의 실행 순서대로 백엔드, 시뮬레이터, 에이전트를 실행합니다.
@@ -187,12 +202,12 @@ PENDING ──> ACK
 ```bash
 python console/svctl.py devices
 python console/svctl.py history dev-001 \
-  --from 202609160000 --to 202609162359 --limit 50
+  --from 202609170000 --to 202609172359 --limit 50
 ```
 
 장치 목록에 `ONLINE`과 최신 온·습도가 표시되고, 측정 이력이 쌓여야 합니다.
 
-### 시나리오 2: 원격 LED 제어
+### 시나리오 2: 원격 LED 제어cle
 
 ```bash
 python console/svctl.py led dev-001 on
@@ -250,6 +265,8 @@ pytest -q
 
 ## 9. 구현 범위 및 미완성 항목
 
+
+
 ### 구현한 1단계 항목
 
 - YAML 기반 에이전트 설정
@@ -265,6 +282,8 @@ pytest -q
 - 30초 기준 ONLINE/OFFLINE 전환 및 이벤트 로그
 - REST API, OpenAPI 문서, CLI 오류 메시지
 
+
+
 ### 현재 구현과 과제 예시의 차이
 
 - 콘솔의 `history`는 과제 예시의 `--last 1h` 대신 현재 `--from YYYYMMDDHHMM --to YYYYMMDDHHMM` 형식을 사용합니다.
@@ -272,11 +291,14 @@ pytest -q
 - 콘솔 LED 명령 대기 시간은 현재 5초입니다.
 - 텔레메트리는 `(device_id, seq)` 멱등 제약 및 로컬 버퍼 재전송을 제공하지 않습니다.
 
+
+
 ## 10. 선택한 심화 과제
 
 현재 선택한 심화 과제: [D] 장애 감지 고도화 
 
 ### 구현 로직
+
 1. 장애 감지 모니터링 쓰레드 구현
   - 마지막 하트비트가 30초가 넘는 장치들을 모니터링하고 있고, 만약 넘는다면 OFFLINE으로 전환한다.
   - 전환 시에 OFFLINE 전환이력을 저장한다.
@@ -284,24 +306,38 @@ pytest -q
   - OFFLINE이었던 장치에서 하트비트가 왔다면 ONLINE으로 전환
   - 전환 시에 ONLINE 전환이력을 저장한다.
 
-### 전환이력 조회 방법 
+
+
+### 전환이력 조회 방법
+
 ```bash
 python console/svctl.py events
 ```
+
+
+
 ## 11. 설계 문서
 
 - [설계 결정 및 구성도](docs/DESIGN.md)
 - [주요 시퀀스 다이어그램](docs/seq_diagrams.md)
 
+
+
 ## 12. AI 도구 및 오픈소스 사용
 
+
+
 ### AI 도구 사용 범위
-- 에이전트의 config 세팅
-- 표준 로깅 모듈 세팅
+
+- 에이전트의 config 기본세팅
+- 표준 로깅 모듈 기본세팅
 - docker-compose.yml, Dockerfile 초안 작성
 - docs 문서 mermaid로 다이어그램 그리기
 - Postgres 접근규약(backend/db.py) 작성
+- pytest 기본세팅(단위테스트 직접구현)
 - API문서 작성
+
+
 
 ### 주요 라이브러리
 
