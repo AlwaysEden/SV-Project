@@ -118,7 +118,7 @@ class SVAgent:
             logger.warning("device_connect_failed url=%s reason=%s", self.device_url, e)
             return
         
-        logger.info("device_connected url=%s", self.device_url)
+        logger.info("device_connected device=%s url=%s", self.device_id, self.device_url)
 
     def close_device(self) -> None:
         if self.ser is None: # 이미 닫혀있으면 조용히 넘어간다. 정상 종료 경로에서도 호출된다.
@@ -140,7 +140,11 @@ class SVAgent:
             elif api == "data_upload": #5초마다
                 response = requests.post(f"{self.backend_url}/api/v1/devices/{self.device_id}/telemetry", json={"samples": data})
             elif api == "device_heartbeat": #10초마다
-                response = requests.post(f"{self.backend_url}/api/v1/devices/{self.device_id}/heartbeat", json={"device_alive": self.device_alive, "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
+                heartbeat_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                response = requests.post(
+                    f"{self.backend_url}/api/v1/devices/{self.device_id}/heartbeat",
+                    json={"device_alive": self.device_alive, "timestamp": heartbeat_at},
+                )
             elif api == "cmd_send": #불특정하게
                 if cmd_status == "ACK" or cmd_status == "NACK":
                     response = requests.patch(f"{self.backend_url}/api/v1/commands/{cmd_id}", json={"status": cmd_status})
@@ -149,7 +153,12 @@ class SVAgent:
             elif api == "device_registration": #에이전트 실행 시 최초 1회만 실행
                 response = requests.post(f"{self.backend_url}/api/v1/devices", json={"device_id": self.device_id, "device_url": self.device_url})
         except requests.RequestException as e: # 네트워크 장애만 여기서 처리한다. 코드 버그는 호출한 쪽으로 올려보낸다.
-            logger.warning("api_failed api=%s reason=%s", api, e)
+            logger.warning(
+                "api_failed api=%s device=%s backend=%s",
+                api,
+                self.device_id,
+                self.backend_url
+            )
             return None
 
         if response is None: # 어느 분기에도 걸리지 않은 호출
@@ -266,7 +275,18 @@ class SVAgent:
                         response = self.send_api("device_heartbeat", None, None, None)
                         if api_ok(response):
                             self.device_alive = False # 장치가 죽었다고 가정. 다음 하트비트 전송시기까지 여전히 죽어있으면 하트비트 못보내도록.
-                            logger.debug("heartbeat_sent")
+                            logger.info(
+                                "heartbeat_sent device=%s backend=%s status=%d",
+                                self.device_id,
+                                self.backend_url,
+                                response.status_code,
+                            )
+                    else:
+                        logger.warning(
+                            "heartbeat_skipped device=%s reason=no_device_message interval=%ss",
+                            self.device_id,
+                            self.heartbeat_interval,
+                        )
                     heartbeat_hb = now
 
                 if now - pending_hb >= self.command_poll_interval: #2초마다 대기중인 CMD 확인
